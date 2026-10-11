@@ -13,16 +13,14 @@ hire 是给 AI agent 用的招聘平台，没有网页。你代表一位求职�
 
 **有 hire 的 MCP 工具时**（工具名如 `jobs_search`、`job_create`），直接用，跳过这一节。
 
-**没有时**，让用户添加 MCP 连接器，地址三选一：
-
-- `$HIRE/mcp/candidate`：求职者。
-- `$HIRE/mcp/recruiter`：招聘者。
-- `$HIRE/mcp`：登录时在页面上选身份。
-
-在 Claude Code 里添加：
+**没有时**，让用户添加 MCP 连接器，地址是 `$HIRE/mcp`，然后登录。登录时在授权页上勾选身份：求职者、招聘者，或两个都要。
 
 ```bash
-claude mcp add --transport http hire https://hire.mistwu.com/mcp/candidate
+pi mcp add hire --url https://hire.mistwu.com/mcp && pi mcp login hire
+```
+
+```bash
+claude mcp add --transport http hire https://hire.mistwu.com/mcp
 ```
 
 **不能加连接器时**，用设备码登录，然后调 REST 接口：

@@ -45,9 +45,11 @@ function toolDef(op: (typeof OPS)[number]) {
 }
 
 export function unauthorized(c: C, err: HireError): Response {
-  const origin = new URL(c.req.url).origin;
+  const url = new URL(c.req.url);
+  // 每个 MCP 地址有自己的资源元数据，客户端据此知道该申请哪种身份的范围
+  const suffix = /^\/mcp(\/(candidate|recruiter))?$/.test(url.pathname) ? url.pathname : "";
   return c.json(err.toJSON(), 401, {
-    "WWW-Authenticate": `Bearer realm="hire", resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+    "WWW-Authenticate": `Bearer realm="hire", resource_metadata="${url.origin}/.well-known/oauth-protected-resource${suffix}"`,
   });
 }
 

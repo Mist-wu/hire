@@ -52,7 +52,7 @@ async function startAuthorize(clientId: string, challenge: string, extra = "") {
   return { res, location, cookie, requestId: location.searchParams.get("state")! };
 }
 
-async function consent(requestId: string, cookie: string, decision: string) {
+async function consent(requestId: string, cookie: string, decision: string, roles: string[] = []) {
   const callback = await SELF.fetch(`${BASE}/oauth/github/callback?code=gh-code&state=${requestId}`, {
     headers: { Cookie: cookie },
     redirect: "manual",
@@ -62,7 +62,7 @@ async function consent(requestId: string, cookie: string, decision: string) {
   const res = await SELF.fetch(`${BASE}/oauth/consent`, {
     method: "POST",
     headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ request_id: requestId, csrf, decision }),
+    body: new URLSearchParams([["request_id", requestId], ["csrf", csrf], ["decision", decision], ...roles.map((r) => ["role", r])]),
     redirect: "manual",
   });
   return { html, callbackStatus: callback.status, location: new URL(res.headers.get("Location") ?? "http://none") };
@@ -108,7 +108,7 @@ describe("OAuth", () => {
     expect(start.location.origin + start.location.pathname).toBe("https://github.com/login/oauth/authorize");
     expect(start.location.searchParams.get("redirect_uri")).toBe(`${BASE}/oauth/github/callback`);
 
-    const done = await consent(start.requestId, start.cookie, "candidate");
+    const done = await consent(start.requestId, start.cookie, "approve", ["candidate"]);
     expect(done.html).toContain("octo");
     expect(done.html).toContain("测试客户端");
     expect(done.html).toContain("127.0.0.1:53111");
@@ -123,7 +123,7 @@ describe("OAuth", () => {
     expect(reused.data.error).toBe("invalid_grant");
 
     const again = await startAuthorize(client.client_id, challenge);
-    const code2 = (await consent(again.requestId, again.cookie, "candidate")).location.searchParams.get("code")!;
+    const code2 = (await consent(again.requestId, again.cookie, "approve", ["candidate"])).location.searchParams.get("code")!;
     const issued = await token({ grant_type: "authorization_code", code: code2, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
     expect(issued.status).toBe(200);
     expect(issued.data).toMatchObject({ token_type: "Bearer", expires_in: 3600, scope: "candidate:read candidate:write candidate:apply" });
@@ -155,9 +155,48 @@ describe("OAuth", () => {
 
     // 指定了 resource 的连接器只能授权对应身份
     const fixed = await startAuthorize(client.client_id, challenge, `&resource=${encodeURIComponent(`${BASE}/mcp/recruiter`)}`);
-    const mismatch = await consent(fixed.requestId, fixed.cookie, "candidate");
-    expect(mismatch.html).not.toContain("以求职者身份授权");
+    const mismatch = await consent(fixed.requestId, fixed.cookie, "approve", ["candidate"]);
+    expect(mismatch.html).not.toContain('value="candidate"');
+    expect(mismatch.html).toContain('value="recruiter"');
     expect(mismatch.location.searchParams.get("error")).toBe("access_denied");
+  });
+
+  it("固定身份的连接器只拿到那种身份的范围，即使客户端申请了全部", async () => {
+    mockGithub({ id: 4545, login: "pi-user" });
+    const unauth = await SELF.fetch(`${BASE}/mcp/candidate`, { method: "POST", body: "{}" });
+    const metaUrl = /resource_metadata="([^"]+)"/.exec(unauth.headers.get("WWW-Authenticate") ?? "")?.[1];
+    expect(metaUrl).toBe(`${BASE}/.well-known/oauth-protected-resource/mcp/candidate`);
+    const meta = await (await SELF.fetch(metaUrl!)).json<any>();
+    expect(meta).toMatchObject({ resource: `${BASE}/mcp/candidate`, scopes_supported: ["candidate:read", "candidate:write", "candidate:apply"] });
+
+    const client = (await register()).data;
+    const { verifier, challenge } = await pkce();
+    const all = "candidate:read candidate:write candidate:apply recruiter:read recruiter:write recruiter:invite";
+    const start = await startAuthorize(client.client_id, challenge, `&scope=${encodeURIComponent(all)}&resource=${encodeURIComponent(`${BASE}/mcp/candidate`)}`);
+    const done = await consent(start.requestId, start.cookie, "approve", ["candidate", "recruiter"]);
+    expect(done.html).not.toContain("发布和关闭岗位");
+    const issued = await token({ grant_type: "authorization_code", code: done.location.searchParams.get("code")!, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
+    expect(issued.data.scope).toBe("candidate:read candidate:write candidate:apply");
+  });
+
+  it("通用地址上可以勾选身份：两个都选、只选一个、一个都不选", async () => {
+    mockGithub({ id: 4646, login: "chooser" });
+    const client = (await register()).data;
+    const { verifier, challenge } = await pkce();
+    const grant = async (roles: string[]) => {
+      const start = await startAuthorize(client.client_id, challenge);
+      const done = await consent(start.requestId, start.cookie, "approve", roles);
+      const code = done.location.searchParams.get("code");
+      if (!code) return { html: done.html, error: done.location.searchParams.get("error") };
+      const issued = await token({ grant_type: "authorization_code", code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
+      return { html: done.html, scope: issued.data.scope as string };
+    };
+    const both = await grant(["candidate", "recruiter"]);
+    expect(both.html).toContain('type="checkbox" name="role" value="candidate" checked');
+    expect(both.scope).toBe("candidate:read candidate:write candidate:apply recruiter:read recruiter:write recruiter:invite");
+    expect((await grant(["recruiter"])).scope).toBe("recruiter:read recruiter:write recruiter:invite");
+    expect((await grant([])).error).toBe("access_denied");
+    expect((await grant(["admin"])).error).toBe("access_denied");
   });
 
   it("授权请求不合法时不跳转到未登记的地址", async () => {

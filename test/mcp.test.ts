@@ -8,8 +8,8 @@ describe("MCP", () => {
   it("没有令牌时返回 401 和资源元数据地址", async () => {
     const res = await SELF.fetch(`${BASE}/mcp`, { method: "POST", body: "{}" });
     expect(res.status).toBe(401);
-    expect(res.headers.get("WWW-Authenticate")).toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource"`);
-    const meta = await (await SELF.fetch(`${BASE}/.well-known/oauth-protected-resource`)).json<any>();
+    expect(res.headers.get("WWW-Authenticate")).toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`);
+    const meta = await (await SELF.fetch(`${BASE}/.well-known/oauth-protected-resource/mcp`)).json<any>();
     expect(meta.authorization_servers).toEqual([BASE]);
   });
 

@@ -6,27 +6,33 @@
 
 ## 它和招聘网站的区别
 
-- **只有接口。** 对外是 REST 和 MCP 两种形式。人只在登录时出现一次：在 GitHub 上确认身份，再在一个授权确认页上点一下。
+- **只有接口。** 对外是 REST 和 MCP 两种形式。人只在登录时出现一次：在 GitHub 上确认身份，再在授权页上勾选身份。
 - **agent 由用户自带。** 平台不运行任何模型。解析简历、判断岗位合不合适，都由用户自己的 agent 完成。
 - **每个动作是一个独立的工具。** 共 23 个工具，10 个只读。用户可以在自己的客户端里，把“搜索岗位”设为始终允许，把“投递”设为每次确认。
 
 ## 用起来
 
-在 Claude Code 里添加连接器，求职者和招聘者各一个地址：
+两步：添加连接器，登录。
+
+**pi**
 
 ```bash
-claude mcp add --transport http hire-candidate https://hire.mistwu.com/mcp/candidate
+pi mcp add hire --url https://hire.mistwu.com/mcp && pi mcp login hire
 ```
+
+**Claude Code**
 
 ```bash
-claude mcp add --transport http hire-recruiter https://hire.mistwu.com/mcp/recruiter
+claude mcp add --transport http hire https://hire.mistwu.com/mcp
 ```
 
-第一次调用工具时，客户端会打开浏览器让你用 GitHub 登录并确认授权。
+然后在会话里输入 `/mcp`，选 hire 登录。
 
-再把 [skills/hire](skills/hire/SKILL.md) 这个技能包装到 agent 里，它说明了每一步该调哪个工具、哪些动作要先问用户。
+登录时浏览器会打开两个页面：先在 GitHub 确认身份，再在 hire 的授权页上勾选身份（求职者、招聘者，或两个都要），点“授权”。
 
-不用 MCP 的话，可以用设备码登录后直接调 REST 接口，步骤见技能包。接口文档在 `/v1/openapi.json`。
+之后直接对 agent 说话就行，比如“帮我找北京每周 4 天的日常实习”或“帮我发一个后端实习岗位”。
+
+想让 agent 用得更稳，把 [skills/hire](skills/hire/SKILL.md) 这个技能包也装上。它说明了每一步该调哪个工具、哪些动作要先问你。不能用 MCP 的 agent 可以按技能包里的步骤，用设备码登录后调 REST 接口。
 
 ## 一次完整的流程
 

@@ -53,6 +53,13 @@ function roleOfResource(resource: string | null | undefined): Role | null {
   return null;
 }
 
+/** 客户端申请的范围。连接器地址固定了身份时，只保留那种身份的范围。 */
+function requestedScopes(request: { scopes: string | null; resource: string | null }): Scope[] {
+  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
+  const role = roleOfResource(request.resource);
+  return role ? requested.filter((s) => ROLE_SCOPES[role].includes(s)) : requested;
+}
+
 function isLoopback(url: URL): boolean {
   return url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }
@@ -92,14 +99,47 @@ function redirectWith(uri: string, params: Record<string, string | null | undefi
   return url.toString();
 }
 
+const PAGE_CSS = `
+:root{--bg:#f2f2f2;--card:#fff;--text:#1d1d1d;--muted:#595959;--line:#d9d9d9;--soft:#f7f7f7;--accent:#f6821f;--accent-hover:#e06d0a;--ok:#2f7d32}
+@media(prefers-color-scheme:dark){:root{--bg:#141414;--card:#1d1d1d;--text:#f2f2f2;--muted:#b6b6b6;--line:#3a3a3a;--soft:#242424;--accent:#f6821f;--accent-hover:#ff9a3d;--ok:#6fbf73}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+main{max-width:30rem;margin:0 auto;padding:3rem 1rem 2rem}
+.brand{display:flex;align-items:center;gap:.5rem;font-weight:700;font-size:1.25rem;letter-spacing:-.01em;margin:0 0 1.25rem .25rem}
+.dot{width:.7rem;height:.7rem;border-radius:50%;background:var(--accent)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:.5rem;overflow:hidden}
+.head{padding:1.5rem 1.5rem 1.25rem}
+h1{font-size:1.25rem;line-height:1.35;font-weight:600;margin:0 0 .5rem}
+p{margin:0}
+.sub{color:var(--muted)}
+.meta{display:grid;grid-template-columns:auto 1fr;gap:.35rem 1rem;padding:1rem 1.5rem;background:var(--soft);border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:.875rem}
+.meta dt{color:var(--muted)}
+.meta dd{margin:0;font-weight:500;word-break:break-all}
+.body{padding:1.25rem 1.5rem}
+.label{font-size:.8125rem;font-weight:600;color:var(--muted);margin:0 0 .75rem}
+.role{display:block;border:1px solid var(--line);border-radius:.375rem;padding:.875rem 1rem;margin:0 0 .75rem}
+label.role{cursor:pointer}
+label.role:has(input:checked){border-color:var(--accent)}
+.role-title{display:flex;align-items:center;gap:.6rem;font-weight:600}
+.role input{width:1rem;height:1rem;margin:0;accent-color:var(--accent)}
+ul{list-style:none;margin:.5rem 0 0;padding:0;font-size:.875rem;color:var(--muted)}
+li{position:relative;padding:.15rem 0 .15rem 1.5rem}
+li::before{content:"✓";position:absolute;left:.15rem;color:var(--ok);font-weight:700}
+.actions{display:flex;justify-content:flex-end;gap:.75rem;padding:1rem 1.5rem;border-top:1px solid var(--line)}
+button{font:inherit;font-weight:500;padding:.5rem 1.25rem;border-radius:.375rem;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
+button:hover{background:var(--soft)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.foot{margin:1rem .25rem 0;font-size:.8125rem;color:var(--muted)}
+@media(max-width:26rem){main{padding-top:1.5rem}.actions{flex-direction:column-reverse}button{width:100%}}
+`;
+
 function page(title: string, inner: string, status: 200 | 400 = 200): Response {
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>
-<style>body{font:16px/1.6 system-ui,sans-serif;max-width:30rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}
-h1{font-size:1.25rem}code{background:#f0f0f0;padding:.1rem .3rem;border-radius:.2rem;word-break:break-all}
-ul{padding-left:1.2rem}button{font:inherit;padding:.5rem 1rem;margin:.25rem .5rem .25rem 0;border:1px solid #1a1a1a;
-border-radius:.3rem;background:#1a1a1a;color:#fff;cursor:pointer}button.deny{background:#fff;color:#1a1a1a}
-.muted{color:#666;font-size:.9rem}</style></head><body>${inner}</body></html>`;
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>${escapeHtml(title)}</title><style>${PAGE_CSS}</style></head>
+<body><main><div class="brand"><span class="dot"></span>hire</div>${inner}</main></body></html>`;
   return new Response(html, {
     status,
     headers: {
@@ -113,7 +153,25 @@ border-radius:.3rem;background:#1a1a1a;color:#fff;cursor:pointer}button.deny{bac
 }
 
 function failPage(message: string): Response {
-  return page("授权失败", `<h1>授权失败</h1><p>${escapeHtml(message)}</p>`, 400);
+  return page(
+    "授权失败",
+    `<div class="card"><div class="head"><h1>授权失败</h1><p class="sub">${escapeHtml(message)}</p></div></div>`,
+    400,
+  );
+}
+
+const ROLE_NAMES: Record<Role, string> = { candidate: "求职者", recruiter: "招聘者" };
+
+/** 这次授权最多能给哪些范围：客户端申请的，没申请就是全部，再按连接器地址收窄。 */
+function grantable(request: { scopes: string | null; resource: string | null }): Scope[] {
+  const requested = requestedScopes(request);
+  if (requested.length) return requested;
+  const role = roleOfResource(request.resource);
+  return role ? ROLE_SCOPES[role] : [...SCOPES];
+}
+
+function rolesIn(scopes: Scope[]): Role[] {
+  return (["candidate", "recruiter"] as Role[]).filter((role) => scopes.some((s) => s.startsWith(`${role}:`)));
 }
 
 interface AuthRequestRow {
@@ -165,10 +223,11 @@ oauth.get("/.well-known/openid-configuration", (c) => c.json(metadata(c)));
 function protectedResource(c: C) {
   const base = origin(c);
   const suffix = new URL(c.req.url).pathname.replace("/.well-known/oauth-protected-resource", "");
+  const role = roleOfResource(suffix);
   return c.json({
     resource: `${base}${suffix || "/mcp"}`,
     authorization_servers: [base],
-    scopes_supported: SCOPES,
+    scopes_supported: role ? ROLE_SCOPES[role] : SCOPES,
     bearer_methods_supported: ["header"],
     resource_name: "hire",
   });
@@ -289,60 +348,59 @@ oauth.get("/oauth/github/callback", async (c) => {
   const client = await c.env.DB.prepare("SELECT name FROM oauth_clients WHERE id = ?")
     .bind(request.client_id)
     .first<{ name: string | null }>();
-  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
-  const fixedRole = roleOfResource(request.resource);
-  const list = (scopes: Scope[]) => `<ul>${scopes.map((s) => `<li>${escapeHtml(SCOPE_LABELS[s])}</li>`).join("")}</ul>`;
-  const button = (value: string, label: string, cls = "") =>
-    `<button name="decision" value="${value}" class="${cls}">${escapeHtml(label)}</button>`;
-
-  let choices: string;
-  if (requested.length) {
-    choices = `<p>它申请的权限：</p>${list(requested)}${button("approve", "授权")}`;
-  } else if (fixedRole) {
-    const label = fixedRole === "candidate" ? "求职者" : "招聘者";
-    choices = `<p>它将以${label}身份操作：</p>${list(ROLE_SCOPES[fixedRole])}${button(fixedRole, "授权")}`;
-  } else {
-    choices = `<p>选择让它用哪个身份操作。</p>
-<p><strong>求职者</strong></p>${list(ROLE_SCOPES.candidate)}${button("candidate", "以求职者身份授权")}
-<p><strong>招聘者</strong></p>${list(ROLE_SCOPES.recruiter)}${button("recruiter", "以招聘者身份授权")}<br>`;
-  }
+  const scopes = grantable(request);
+  const roles = rolesIn(scopes);
+  const clientName = escapeHtml(client?.name ?? "未命名客户端");
   let host = request.redirect_uri;
   try {
     const u = new URL(request.redirect_uri);
     host = u.host || u.protocol;
   } catch {}
+
+  const roleBlock = (role: Role) => {
+    const items = scopes
+      .filter((s) => s.startsWith(`${role}:`))
+      .map((s) => `<li>${escapeHtml(SCOPE_LABELS[s])}</li>`)
+      .join("");
+    // 两种身份都可选时用复选框，让人决定给哪一种；只有一种时不需要选
+    return roles.length > 1
+      ? `<label class="role"><span class="role-title"><input type="checkbox" name="role" value="${role}" checked>${ROLE_NAMES[role]}</span><ul>${items}</ul></label>`
+      : `<div class="role"><input type="hidden" name="role" value="${role}"><span class="role-title">${ROLE_NAMES[role]}</span><ul>${items}</ul></div>`;
+  };
+
   return page(
     "授权访问 hire",
-    `<h1>授权访问 hire</h1>
-<p>你已用 GitHub 账号 <strong>${escapeHtml(user.login)}</strong> 登录。</p>
-<p>客户端 <strong>${escapeHtml(client?.name ?? "未命名客户端")}</strong> 想访问你的 hire 账号。授权后会跳转到 <code>${escapeHtml(host)}</code>。</p>
-<form method="post" action="/oauth/consent">
+    `<form method="post" action="/oauth/consent" class="card">
 <input type="hidden" name="request_id" value="${escapeHtml(request.id)}">
 <input type="hidden" name="csrf" value="${escapeHtml(request.csrf)}">
-${choices}${button("deny", "拒绝", "deny")}
+<div class="head"><h1>允许 ${clientName} 访问你的 hire 账号？</h1>
+<p class="sub">它会代表你操作。你可以随时在客户端里退出登录来收回授权。</p></div>
+<dl class="meta"><dt>GitHub 账号</dt><dd>${escapeHtml(user.login)}</dd><dt>客户端</dt><dd>${clientName}</dd><dt>授权后跳转到</dt><dd>${escapeHtml(host)}</dd></dl>
+<div class="body"><p class="label">${roles.length > 1 ? "选择让它使用的身份" : "它可以做这些事"}</p>
+${roles.map(roleBlock).join("")}</div>
+<div class="actions"><button name="decision" value="deny">拒绝</button><button name="decision" value="approve" class="primary">授权</button></div>
 </form>
-<p class="muted">如果你没有在某个 AI 客户端里主动添加 hire，请点拒绝。</p>`,
+<p class="foot">如果你没有在某个 AI 客户端里主动添加 hire，请点拒绝。</p>`,
   );
 });
 
 oauth.post("/oauth/consent", async (c) => {
-  const form = await body(c);
-  const request = await loadRequest(c, form.request_id ?? "");
-  if (!request || !request.account_id || !safeEqual(form.csrf ?? "", request.csrf)) {
+  const form = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>);
+  const field = (name: string) => (typeof form[name] === "string" ? (form[name] as string) : "");
+  const request = await loadRequest(c, field("request_id"));
+  if (!request || !request.account_id || !safeEqual(field("csrf"), request.csrf)) {
     return failPage("这次授权已过期或无效。请回到客户端重新开始。");
   }
   await c.env.DB.prepare("DELETE FROM auth_requests WHERE id = ?").bind(request.id).run();
   deleteCookie(c, COOKIE, { path: "/oauth" });
 
-  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
-  const fixedRole = roleOfResource(request.resource);
-  const decision = form.decision ?? "deny";
-  let scopes: Scope[] | null = null;
-  if (decision === "approve" && requested.length) scopes = requested;
-  else if (!requested.length && (decision === "candidate" || decision === "recruiter")) {
-    if (!fixedRole || fixedRole === decision) scopes = ROLE_SCOPES[decision];
-  }
-  if (!scopes) {
+  // 只发页面上列出过、并且用户勾选了身份的那些范围
+  const chosen = [form.role].flat().filter((r): r is string => typeof r === "string");
+  const scopes =
+    field("decision") === "approve"
+      ? grantable(request).filter((s) => chosen.includes(s.split(":")[0]!))
+      : [];
+  if (!scopes.length) {
     return c.redirect(redirectWith(request.redirect_uri, { error: "access_denied", state: request.state }), 303);
   }
   const code = `hire_ac_${randomHex(32)}`;
