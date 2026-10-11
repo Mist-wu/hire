@@ -51,13 +51,14 @@ function d1(sql) {
 }
 
 const tokens = new Map();
-function accountSql(key, githubId, login) {
+function accountSql(key, githubId, login, role) {
   const token = `hire_at_${randomBytes(32).toString("hex")}`;
   tokens.set(key, token);
   return [
-    `INSERT INTO accounts (id, github_id, github_login, created_at)
-     VALUES (${q(`acc_${randomBytes(10).toString("hex")}`)}, ${githubId}, ${q(login)}, ${q(now)})
-     ON CONFLICT (github_id) DO NOTHING;`,
+    // 一个账号只有一种身份。已有身份的账号不改
+    `INSERT INTO accounts (id, github_id, github_login, role, created_at)
+     VALUES (${q(`acc_${randomBytes(10).toString("hex")}`)}, ${githubId}, ${q(login)}, ${q(role)}, ${q(now)})
+     ON CONFLICT (github_id) DO UPDATE SET role = COALESCE(accounts.role, excluded.role);`,
     `INSERT INTO tokens (id, account_id, client_id, scopes, access_hash, access_expires_at, refresh_hash, refresh_expires_at, created_at)
      SELECT ${q(`tok_seed_${randomBytes(8).toString("hex")}`)}, id, NULL, ${q(ALL_SCOPES)}, ${q(sha(token))}, ${q(expires)},
             ${q(`seed-${randomBytes(16).toString("hex")}`)}, ${q(now)}, ${q(now)}
@@ -65,8 +66,8 @@ function accountSql(key, githubId, login) {
   ];
 }
 
-const sql = [...accountSql("owner", ownerId, ownerLogin)];
-data.candidates.forEach((c, i) => sql.push(...accountSql(c.login, -(900001 + i), c.login)));
+const sql = [...accountSql("owner", ownerId, ownerLogin, "recruiter")];
+data.candidates.forEach((c, i) => sql.push(...accountSql(c.login, -(900001 + i), c.login, "candidate")));
 for (const c of data.companies) {
   sql.push(
     `INSERT INTO companies (id, owner_account_id, name, industry, scale, stage, website, intro, contact_email, created_at, updated_at)
@@ -102,7 +103,8 @@ try {
   } while (cursor);
 
   let created = 0;
-  for (const { company, ...fields } of data.jobs) {
+  // 旧数据文件里可能还有已经去掉的字段
+  for (const { company, teams, source_url, salary_months, custom_fields, ...fields } of data.jobs) {
     const companyId = `com_demo_${company}`;
     if (existing.has(`${companyId}|${fields.title}`)) continue;
     await call("POST", "/jobs", owner, { ...fields, company_id: companyId });

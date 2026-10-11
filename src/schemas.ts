@@ -20,11 +20,15 @@ import {
 z.config(z.locales.zhCN());
 
 const str = (max: number) => z.string().trim().min(1).max(max);
+const httpUrl = z
+  .url({ protocol: /^https?$/ })
+  .max(300)
+  .describe("http 或 https 地址");
 const month = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "格式为 YYYY-MM");
 const id = (what: string) => z.string().min(1).max(64).describe(`${what}编号`);
 
 export const RecruitTypeEnum = z.enum(keysOf(RECRUIT_TYPES)).describe(`招聘类型：${ENUM_DOCS.recruit_type}`);
-export const CategoryEnum = z.enum(CATEGORIES).describe(`职类，写成“一级.二级”：${ENUM_DOCS.category}`);
+export const CategoryEnum = z.enum(CATEGORIES).describe("职类，写成“一级.二级”，从枚举里选最接近的");
 export const ExperienceEnum = z.enum(keysOf(EXPERIENCES)).describe(`经验要求：${ENUM_DOCS.experience}`);
 export const DegreeEnum = z.enum(keysOf(DEGREES)).describe(`学历：${ENUM_DOCS.degree}`);
 export const SalaryUnitEnum = z.enum(keysOf(SALARY_UNITS)).describe(`薪资单位：${ENUM_DOCS.salary_unit}`);
@@ -45,7 +49,7 @@ export const CompanyInput = z.strictObject({
   industry: str(40).nullable().optional().describe("行业，自由文本"),
   scale: z.enum(keysOf(COMPANY_SCALES)).nullable().optional().describe(`规模：${ENUM_DOCS.scale}`),
   stage: z.enum(keysOf(COMPANY_STAGES)).nullable().optional().describe(`融资阶段：${ENUM_DOCS.stage}`),
-  website: z.url().max(300).nullable().optional(),
+  website: httpUrl.nullable().optional(),
   intro: str(1000).nullable().optional().describe("公司介绍，1000 字以内"),
   contact_email: z.email().max(200).nullable().optional().describe("邀约被接受后，求职者能看到这个邮箱"),
 });
@@ -58,14 +62,12 @@ const jobShape = {
   category: CategoryEnum,
   cities: z.array(str(20)).min(1).max(10).describe('工作城市，至少一个，如 ["北京"]'),
   remote: z.boolean().optional().describe("是否可远程，默认 false"),
-  teams: z.array(str(40)).max(10).optional().describe("部门或事业群，自由文本"),
   experience: ExperienceEnum,
   degree: DegreeEnum.describe(`最低学历要求：${ENUM_DOCS.degree}`),
   grad_years: z.array(z.int().min(2000).max(2100)).max(6).optional().describe("面向届别，如 [2027, 2028]"),
   salary_min: z.int().min(0).nullable().optional().describe("薪资下限。不面议时必填"),
   salary_max: z.int().min(0).nullable().optional().describe("薪资上限。不面议时必填"),
   salary_unit: SalaryUnitEnum.nullable().optional(),
-  salary_months: z.int().min(12).max(24).nullable().optional().describe("年薪月数，如 14"),
   salary_negotiable: z.boolean().optional().describe("是否面议，默认 false"),
   days_per_week: z.int().min(1).max(7).nullable().optional().describe("每周到岗天数。实习岗位必填，其他类型不要传"),
   min_months: z.int().min(1).max(24).nullable().optional().describe("最短实习月数。实习岗位必填，其他类型不要传"),
@@ -75,14 +77,18 @@ const jobShape = {
   bonus: str(3000).nullable().optional().describe("加分项"),
   skills: z.array(str(30)).max(15).optional().describe("技能标签，最多 15 个"),
   headcount: z.int().min(1).max(9999).nullable().optional().describe("招聘人数"),
-  deadline: z.iso.date().nullable().optional().describe("截止日期，YYYY-MM-DD"),
-  source_url: z.url().max(500).nullable().optional().describe("参考来源链接"),
-  custom_fields: z.record(z.string().max(40), z.string().max(500)).optional().describe("自定义键值对，最多 10 项"),
+  deadline: z.iso.date().nullable().optional().describe("截止日期，YYYY-MM-DD。过了这一天岗位不再出现在搜索里，也不能投递"),
   questions: z
     .array(
       z.strictObject({
         text: str(200).describe("问题"),
-        options: z.array(str(60)).min(2).max(6).optional().describe("可选答案。传了就是单选题，不传是问答题"),
+        options: z
+          .array(str(60))
+          .min(2)
+          .max(6)
+          .refine((list) => new Set(list).size === list.length, "选项不能重复")
+          .optional()
+          .describe("可选答案。传了就是单选题，不传是问答题"),
       }),
     )
     .max(3)
@@ -127,9 +133,6 @@ export function checkJob(job: JobFields): void {
     if (job.salary_min != null && job.salary_max != null && job.salary_min > job.salary_max) {
       issues.push({ field: "salary_min", message: "薪资下限不能高于上限。" });
     }
-  }
-  if (job.custom_fields && Object.keys(job.custom_fields).length > 10) {
-    issues.push({ field: "custom_fields", message: "自定义字段最多 10 项。" });
   }
   if (issues.length) throw invalid(issues);
 }
@@ -191,22 +194,22 @@ const projectItem = z.strictObject({
   start: month.optional(),
   end: month.nullable().optional(),
   description: str(2000).optional(),
-  link: z.url().max(300).optional(),
+  link: httpUrl.optional(),
 });
 
 const resumeShape = {
   name: str(30).describe("姓名"),
   school: str(50).describe("学校"),
   degree: PersonDegreeEnum,
-  major: str(50).describe("专业"),
+  major: str(50).nullable().describe("专业。传 null 清空"),
   grad_year: z.int().min(1980).max(2100).describe("毕业年份"),
-  city: str(20).describe("现居城市"),
-  summary: str(500).describe("个人简介，500 字以内"),
+  city: str(20).nullable().describe("现居城市。传 null 清空"),
+  summary: str(500).nullable().describe("个人简介，500 字以内。传 null 清空"),
   skills: z.array(str(30)).max(30).describe("技能标签，最多 30 个"),
   education: z.array(educationItem).max(10),
   experience: z.array(experienceItem).max(20).describe("工作和实习经历"),
   projects: z.array(projectItem).max(20),
-  links: z.array(z.url().max(300)).max(10).describe("GitHub、个人网站等链接"),
+  links: z.array(httpUrl).max(10).describe("GitHub、个人网站等链接"),
 };
 
 export const ResumeContent = z.strictObject(resumeShape).partial();
@@ -228,18 +231,16 @@ export const ProfileUpdateInput = ResumeContent.extend({
     .string()
     .trim()
     .regex(/^\+?\d[\d\- ]{5,19}$/, "手机号格式不对")
+    .nullable()
     .optional()
-    .describe("手机号。只有接受邀约后，对方才能看到"),
-  email: z.email().max(200).optional().describe("邮箱。只有接受邀约后，对方才能看到"),
+    .describe("手机号。只有接受邀约后，对方才能看到。传 null 清空"),
+  email: z.email().max(200).nullable().optional().describe("邮箱。只有接受邀约后，对方才能看到。传 null 清空"),
+  resume_public: z.boolean().optional().describe("是否出现在招聘者的搜索里，默认 true。关闭后，已经收到你投递的招聘者仍然能看简历"),
 });
 
 export const ResumeUploadInput = z.strictObject({
   filename: str(120).describe("文件名，如 张三-后端.pdf"),
   content_base64: z.string().min(1).describe("PDF 文件内容的 base64 编码，原文件不超过 5 MB"),
-});
-
-export const VisibilityInput = z.strictObject({
-  public: z.boolean().describe("true=出现在招聘者的搜索里，false=不出现"),
 });
 
 export const CandidatesSearchInput = z.strictObject({
@@ -257,11 +258,6 @@ export const CandidatesSearchInput = z.strictObject({
 // ---------- 投递 ----------
 
 const note = z.string().trim().max(500).optional().describe("给对方的备注，500 字以内");
-const AsRole = z
-  .enum(["candidate", "recruiter"])
-  .optional()
-  .describe("同一个账号既是求职者又是这个岗位的招聘者时，指定用哪个身份");
-
 export const ApplicationCreateInput = z.strictObject({
   job_id: id("岗位"),
   custom_resume: ResumeContent.optional().describe("针对这个岗位改写的简历，只有这个岗位的招聘者能看。不传就用公开简历"),
@@ -284,7 +280,7 @@ export const JobApplicationsListInput = z.strictObject({
   ...pageShape,
 });
 
-export const ApplicationGetInput = z.strictObject({ application_id: id("投递"), as: AsRole });
+export const ApplicationGetInput = z.strictObject({ application_id: id("投递") });
 
 export const ApplicationActionInput = z.strictObject({ application_id: id("投递"), note });
 
@@ -310,7 +306,7 @@ export const OfferRespondInput = z.strictObject({
 });
 
 export const InvitationCreateInput = z.strictObject({
-  application_id: id("投递").optional().describe("回应一条已有的投递时传它"),
+  application_id: id("投递").optional().describe("回应一条已有的投递，或给一条已发出的邀约改时间时传它"),
   job_id: id("岗位").optional().describe("主动邀约时传，必须和 candidate_id 一起"),
   candidate_id: id("求职者").optional().describe("主动邀约时传，必须和 job_id 一起"),
   mode: z.enum(["online", "onsite", "phone"]).describe("面试方式：online=线上，onsite=线下，phone=电话"),
@@ -319,7 +315,7 @@ export const InvitationCreateInput = z.strictObject({
     .min(1)
     .max(5)
     .describe('可选的面试时间，1 到 5 个，带时区，如 "2026-10-20T14:00:00+08:00"'),
-  location: str(200).optional().describe("线下地址或会议说明"),
+  location: str(200).optional().describe("线下地址或会议说明。onsite 时必填"),
   note,
 });
 
@@ -336,7 +332,7 @@ export const CandidateGetInput = z.strictObject({ candidate_id: id("求职者") 
 export const EmptyInput = z.strictObject({});
 
 export const EventsPollInput = z.strictObject({
-  after: z.int().min(0).optional().describe("上次拿到的最大序号。第一次不传"),
+  after: z.int().min(0).optional().describe("一般不传：服务端记着你上次拉到哪，只返回之后的新事件。想重看旧事件时传序号，传 0 从头看"),
   limit: z.int().min(1).max(100).optional().describe("最多返回几条，默认 50"),
 });
 

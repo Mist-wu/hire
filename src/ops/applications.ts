@@ -23,9 +23,9 @@ import {
   CONTACT_STATUSES,
     type ApplicationStatus,
 } from "../taxonomy";
-import { beijingDay, newId, nowIso, parseJson, randomHex } from "../util";
+import { beijingDate, beijingDay, newId, nowIso, parseJson, randomHex } from "../util";
 import { candidatePublic, loadCandidate, missingForApply, pdfInfo } from "./candidates";
-import { loadJob } from "./jobs";
+import { acceptsApplications, loadJob } from "./jobs";
 import { deliverMatches } from "./subscriptions";
 
 const REAPPLY_DAYS = 7;
@@ -40,7 +40,7 @@ interface AppRow {
   invitation: string | null;
   chosen_slot: string | null;
   answers: string | null;
-  responded_at: string | null;
+  decided_at: string | null;
   reject_reason: string | null;
   offer: string | null;
   closed_by: string | null;
@@ -112,16 +112,12 @@ async function loadApp(db: D1Database, id: string): Promise<AppRow> {
   return row;
 }
 
-/** 判断调用者以哪个身份看这条投递。两边都不是就当作不存在。 */
-function sideOf(ctx: Ctx, app: AppRow, need: "read" | "act", prefer?: Role): Role {
-  const scope = (role: Role) => (need === "read" ? `${role}:read` : role === "candidate" ? "candidate:apply" : "recruiter:invite");
-  const can = (role: Role) =>
-    ctx.auth.scopes.has(scope(role) as never) &&
-    (role === "candidate" ? app.candidate_id === ctx.auth.accountId : app.owner_account_id === ctx.auth.accountId);
-  if (prefer && can(prefer)) return prefer;
-  if (can("recruiter")) return "recruiter";
-  if (can("candidate")) return "candidate";
-  throw notFound("投递");
+/** 调用者是这条投递的哪一方。两边都不是就当作不存在。 */
+function sideOf(ctx: Ctx, app: AppRow): Role {
+  const role = ctx.auth.role;
+  const owner = role === "candidate" ? app.candidate_id : app.owner_account_id;
+  if (!role || owner !== ctx.auth.accountId) throw notFound("投递");
+  return role;
 }
 
 function mustOwn(ctx: Ctx, app: AppRow, role: Role): void {
@@ -174,8 +170,9 @@ async function transition(
     set.ended_at = now;
     if (to !== "hired") set.closed_by = opts.actor;
   }
-  // 招聘者第一次处理求职者的投递，记下时间，用来算处理比例
-  if (opts.actor === "recruiter" && app.initiated_by === "candidate" && !app.responded_at) set.responded_at = now;
+  // 招聘者第一次对求职者的投递做出决定（邀约或拒绝），记下时间。只是查看不算
+  const decision = to === "invited" || to === "rejected";
+  if (opts.actor === "recruiter" && decision && app.initiated_by === "candidate" && !app.decided_at) set.decided_at = now;
   const cols = Object.keys(set);
   const recipient = opts.event.to === "candidate" ? app.candidate_id : app.owner_account_id;
   const guard = "WHERE EXISTS (SELECT 1 FROM applications WHERE id = ? AND rev = ?)";
@@ -217,6 +214,9 @@ async function transition(
   }
 }
 
+/**
+ * 新建投递。限额写在插入语句的条件里：先数再插分两步的话，并发请求能一起挤过上限。
+ */
 async function insertApplication(
   db: D1Database,
   fields: {
@@ -228,18 +228,27 @@ async function insertApplication(
     answers?: Answer[];
     invitation?: Invitation;
     note?: string;
+    quota: { limit: number; what: string };
     event: { accountId: string; to: Role; type: string; payload: unknown };
   },
 ): Promise<string> {
   const id = newId("app");
   const now = nowIso();
+  const day = beijingDay();
+  // 求职者的限额按人算，招聘者主动邀约的限额按岗位算
+  const scope = fields.initiatedBy === "candidate" ? "candidate_id" : "job_id";
+  const scopeValue = fields.initiatedBy === "candidate" ? fields.candidateId : fields.jobId;
+  const created = "WHERE EXISTS (SELECT 1 FROM applications WHERE id = ?)";
+  let results;
   try {
-    await db.batch([
+    results = await db.batch([
       db
         .prepare(
           `INSERT INTO applications (id, job_id, candidate_id, initiated_by, status, custom_resume, invitation,
              rev, created_at, updated_at, answers)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)`,
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10
+           WHERE (SELECT COUNT(*) FROM applications
+                  WHERE ${scope} = ?11 AND initiated_by = ?4 AND created_at >= ?12) < ?13`,
         )
         .bind(
           id,
@@ -252,24 +261,28 @@ async function insertApplication(
           randomHex(8),
           now,
           fields.answers?.length ? JSON.stringify(fields.answers) : null,
+          scopeValue,
+          day.start,
+          fields.quota.limit,
         ),
       db
         .prepare(
           `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
-           VALUES (?, ?, NULL, ?, ?, ?)`,
+           SELECT ?, ?, NULL, ?, ?, ? ${created}`,
         )
-        .bind(id, fields.initiatedBy, fields.status, fields.note ?? null, now),
+        .bind(id, fields.initiatedBy, fields.status, fields.note ?? null, now, id),
       db
         .prepare(
           `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+           SELECT ?, ?, ?, ?, ?, ? ${created}`,
         )
-        .bind(fields.event.accountId, fields.event.to, fields.event.type, id, JSON.stringify(fields.event.payload), now),
+        .bind(fields.event.accountId, fields.event.to, fields.event.type, id, JSON.stringify(fields.event.payload), now, id),
     ]);
   } catch (err) {
     if (String(err).includes("UNIQUE")) throw duplicate(null);
     throw err;
   }
+  if (!results[0]?.meta.changes) throw quotaExceeded(fields.quota.what, fields.quota.limit, day.end);
   return id;
 }
 
@@ -277,7 +290,7 @@ function duplicate(existing: { id: string; status: string } | null, retryAfter?:
   if (retryAfter) {
     return new HireError(
       "duplicate_application",
-      `这个岗位上一条投递结束还不到 ${REAPPLY_DAYS} 天。retry_after 之后才能再投，现在不要重试。`,
+      `这个岗位和这位求职者之间，上一条投递被拒绝或撤回还不到 ${REAPPLY_DAYS} 天。retry_after 之后才能再发起，现在不要重试。`,
       { application_id: existing?.id, status: existing?.status, retry_after: retryAfter },
     );
   }
@@ -295,6 +308,15 @@ async function latestBetween(db: D1Database, jobId: string, candidateId: string)
     )
     .bind(jobId, candidateId)
     .first<{ id: string; status: ApplicationStatus; ended_at: string | null }>();
+}
+
+/** 同一对岗位和求职者：有未结束的投递不能再建；被拒绝或撤回后 7 天内，任何一方都不能再发起。 */
+function checkRepeat(last: { id: string; status: ApplicationStatus; ended_at: string | null } | null): void {
+  if (!last) return;
+  if (ACTIVE_STATUSES.includes(last.status)) throw duplicate(last);
+  if (last.status !== "rejected" && last.status !== "withdrawn") return;
+  const retryAt = new Date(new Date(last.ended_at ?? 0).getTime() + REAPPLY_DAYS * 86400000);
+  if (retryAt.getTime() > Date.now()) throw duplicate(last, retryAt.toISOString());
 }
 
 function checkSlots(slots: string[]): string[] {
@@ -380,7 +402,7 @@ export const applicationOps = [
     name: "application_create",
     title: "投递岗位",
     description:
-      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。岗位有筛选问题（job_get 返回的 questions）时，必须在 answers 里按顺序逐个回答，答案要来自用户，不要自己编。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。每天最多投 20 次。",
+      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。岗位有筛选问题（job_get 返回的 questions）时，必须在 answers 里按顺序逐个回答，答案要来自用户，不要自己编。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。岗位暂停、关闭或过了截止日期时不能投。每天最多投 20 次。",
     method: "POST",
     path: "/applications",
     scopes: ["candidate:apply"],
@@ -397,18 +419,14 @@ export const applicationOps = [
         );
       }
       const { job, company } = await loadJob(ctx.db, input.job_id);
-      if (job.status !== "open") {
-        throw new HireError("job_not_open", "这个岗位现在不接受投递。", { current_status: job.status });
+      if (!acceptsApplications(job)) {
+        throw new HireError("job_not_open", "这个岗位现在不接受投递：已暂停、已关闭，或过了截止日期。", {
+          current_status: job.status,
+          deadline: job.deadline,
+        });
       }
-      const last = await latestBetween(ctx.db, job.id, me);
-      if (last) {
-        if (ACTIVE_STATUSES.includes(last.status)) throw duplicate(last);
-        const retryAt = new Date(new Date(last.ended_at ?? 0).getTime() + REAPPLY_DAYS * 86400000);
-        if (retryAt.getTime() > Date.now()) throw duplicate(last, retryAt.toISOString());
-      }
+      checkRepeat(await latestBetween(ctx.db, job.id, me));
       const answers = checkAnswers(parseJson<Question[]>(job.questions, []), input.answers);
-      const limit = limits(ctx.env).applyPerDay;
-      if ((await appliedToday(ctx.db, me)) >= limit) throw quotaExceeded("今天的投递次数", limit, beijingDay().end);
 
       const id = await insertApplication(ctx.db, {
         jobId: job.id,
@@ -418,6 +436,7 @@ export const applicationOps = [
         customResume: input.custom_resume,
         answers,
         note: input.note,
+        quota: { limit: limits(ctx.env).applyPerDay, what: "今天的投递次数" },
         event: {
           accountId: company.owner_account_id,
           to: "recruiter",
@@ -488,7 +507,7 @@ export const applicationOps = [
     input: ApplicationGetInput,
     handler: async (ctx, input) => {
       let app = await loadApp(ctx.db, input.application_id);
-      const side = sideOf(ctx, app, "read", input.as);
+      const side = sideOf(ctx, app);
       if (side === "recruiter" && app.status === "applied") {
         try {
           await transition(ctx.db, app, ["applied"], "viewed", {
@@ -557,6 +576,9 @@ export const applicationOps = [
             },
           ]);
         }
+        if (app.status === "invited" && slot && new Date(slot).getTime() <= Date.now()) {
+          throw invalid([{ field: "slot", message: "这个时间已经过了，选一个还没到的。都过了就拒绝，并在备注里请对方重新约。" }]);
+        }
         await transition(ctx.db, app, ["invited"], "accepted", {
           actor: "candidate",
           note: input.note,
@@ -572,7 +594,7 @@ export const applicationOps = [
     name: "invitation_create",
     title: "发出面试邀约",
     description:
-      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间。主动邀约每个岗位每天最多 20 次。",
+      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递，对一条还没回应的邀约再调一次就是改时间；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间，线下面试要写地址。主动邀约每个岗位每天最多 20 次；对方拒绝或撤回后 7 天内不能再邀约同一个人。",
     method: "POST",
     path: "/invitations",
     scopes: ["recruiter:invite"],
@@ -586,6 +608,9 @@ export const applicationOps = [
           "入参二选一：回应投递传 application_id；主动邀约传 job_id 和 candidate_id。",
         );
       }
+      if (input.mode === "onsite" && !input.location) {
+        throw invalid([{ field: "location", message: "线下面试必须写地址。" }]);
+      }
       const invitation: Invitation = {
         mode: input.mode,
         slots: checkSlots(input.slots),
@@ -595,27 +620,25 @@ export const applicationOps = [
       if (input.application_id) {
         const app = await loadApp(ctx.db, input.application_id);
         mustOwn(ctx, app, "recruiter");
-        await transition(ctx.db, app, ["applied", "viewed"], "invited", {
+        await transition(ctx.db, app, ["applied", "viewed", "invited"], "invited", {
           actor: "recruiter",
           note: input.note,
           set: { invitation: JSON.stringify(invitation) },
-          event: { to: "candidate", type: "invitation.created" },
+          event: { to: "candidate", type: app.status === "invited" ? "invitation.updated" : "invitation.created" },
         });
         return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
       }
 
       const { job, company } = await loadJob(ctx.db, input.job_id!, ctx.auth.accountId);
-      if (job.status !== "open") {
-        throw new HireError("job_not_open", "这个岗位没有开放，不能发邀约。", { current_status: job.status });
+      if (!acceptsApplications(job)) {
+        throw new HireError("job_not_open", "这个岗位没有开放或过了截止日期，不能发邀约。", {
+          current_status: job.status,
+          deadline: job.deadline,
+        });
       }
       const candidate = await loadCandidate(ctx.db, input.candidate_id!);
       if (!candidate || candidate.name == null || candidate.resume_public !== 1) throw notFound("求职者");
-      const last = await latestBetween(ctx.db, job.id, candidate.account_id);
-      if (last && ACTIVE_STATUSES.includes(last.status)) throw duplicate(last);
-      const limit = limits(ctx.env).invitePerJobPerDay;
-      if ((await invitedToday(ctx.db, job.id)) >= limit) {
-        throw quotaExceeded("这个岗位今天的主动邀约次数", limit, beijingDay().end);
-      }
+      checkRepeat(await latestBetween(ctx.db, job.id, candidate.account_id));
       const id = await insertApplication(ctx.db, {
         jobId: job.id,
         candidateId: candidate.account_id,
@@ -623,6 +646,7 @@ export const applicationOps = [
         status: "invited",
         invitation,
         note: input.note,
+        quota: { limit: limits(ctx.env).invitePerJobPerDay, what: "这个岗位今天的主动邀约次数" },
         event: {
           accountId: candidate.account_id,
           to: "candidate",
@@ -678,6 +702,9 @@ export const applicationOps = [
       if ((input.salary == null) !== (input.salary_unit == null)) {
         throw invalid([{ field: "salary_unit", message: "salary 和 salary_unit 必须一起传。" }]);
       }
+      const today = beijingDate();
+      const past = (["start_date", "reply_by"] as const).filter((key) => input[key] && input[key]! < today);
+      if (past.length) throw invalid(past.map((field) => ({ field, message: "日期不能在过去。" })));
       const app = await loadApp(ctx.db, input.application_id);
       mustOwn(ctx, app, "recruiter");
       const offer = {
@@ -700,7 +727,7 @@ export const applicationOps = [
     name: "offer_respond",
     title: "回应录用",
     description:
-      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。这一步不能撤销，回应前先让用户确认。",
+      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。岗位填了招聘人数、录用人数到了的话，岗位会自动暂停。这一步不能撤销，回应前先让用户确认。",
     method: "POST",
     path: "/applications/:application_id/offer/respond",
     scopes: ["candidate:apply"],
@@ -715,6 +742,16 @@ export const applicationOps = [
         note: input.note,
         event: { to: "recruiter", type: input.accept ? "offer.accepted" : "application.rejected" },
       });
+      // 录用人数到了招聘人数，岗位自动暂停，等招聘者决定是关闭还是继续招
+      if (input.accept) {
+        await ctx.db
+          .prepare(
+            `UPDATE jobs SET status = 'paused' WHERE id = ?1 AND status = 'open' AND headcount IS NOT NULL
+               AND (SELECT COUNT(*) FROM applications WHERE job_id = ?1 AND status = 'hired') >= headcount`,
+          )
+          .bind(app.job_id)
+          .run();
+      }
       return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
     },
   }),
@@ -723,7 +760,7 @@ export const applicationOps = [
     name: "events_poll",
     title: "拉取新事件",
     description:
-      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约被接受、收到录用、录用被接受、被拒绝、被撤回、岗位关闭，以及订阅命中的新岗位（job.matched，没有 application_id，用 job_get 读详情）。传 after（上次返回的 next_after）只取之后的事件。事件里只有摘要，投递详情用 application_get 取。有未结束的投递或有订阅时每 10 分钟拉一次就够，每分钟最多 6 次。",
+      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约改了时间、邀约被接受、收到录用、录用被接受、被拒绝、被撤回、岗位关闭、投递过期，以及订阅命中的新岗位（job.matched，没有 application_id，用 job_get 读详情）。服务端记着你上次拉到哪，直接调用就只返回新事件；has_more 为 true 时再调一次。想重看旧事件时传 after。事件里只有摘要，投递详情用 application_get 取。有未结束的投递或有订阅时每 10 分钟拉一次就够，每分钟最多 6 次。",
     method: "GET",
     path: "/events",
     scopes: [],
@@ -731,31 +768,40 @@ export const applicationOps = [
     input: EventsPollInput,
     handler: async (ctx, input) => {
       await hitRate(ctx.db, `poll:${ctx.auth.accountId}`, limits(ctx.env).pollPerMin, "每分钟拉取事件的次数");
-      const audiences = (["candidate", "recruiter"] as Role[]).filter((role) =>
-        [...ctx.auth.scopes].some((s) => s.startsWith(`${role}:`)),
-      );
-      if (!audiences.length) return { events: [], next_after: input.after ?? 0, has_more: false };
-      if (audiences.includes("candidate")) await deliverMatches(ctx);
+      const role = ctx.auth.role;
+      if (!role || !ctx.auth.scopes.size) return { events: [], next_after: input.after ?? 0, has_more: false };
+      if (role === "candidate") await deliverMatches(ctx);
+      const account = await ctx.db
+        .prepare("SELECT events_cursor FROM accounts WHERE id = ?")
+        .bind(ctx.auth.accountId)
+        .first<{ events_cursor: number }>();
+      const after = input.after ?? account?.events_cursor ?? 0;
       const limit = input.limit ?? 50;
       const { results } = await ctx.db
         .prepare(
-          `SELECT seq, audience, type, application_id, payload, created_at FROM events
-           WHERE account_id = ? AND seq > ? AND audience IN (${audiences.map(() => "?").join(", ")})
-           ORDER BY seq LIMIT ?`,
+          `SELECT seq, type, application_id, payload, created_at FROM events
+           WHERE account_id = ? AND seq > ? AND audience = ? ORDER BY seq LIMIT ?`,
         )
-        .bind(ctx.auth.accountId, input.after ?? 0, ...audiences, limit + 1)
-        .all<{ seq: number; audience: string; type: string; application_id: string | null; payload: string; created_at: string }>();
+        .bind(ctx.auth.accountId, after, role, limit + 1)
+        .all<{ seq: number; type: string; application_id: string | null; payload: string; created_at: string }>();
       const page = results.slice(0, limit);
+      const nextAfter = page[page.length - 1]?.seq ?? after;
+      // 记下拉到哪了。下次不传 after 就从这里接着拉，agent 换了会话也不会把旧事件再报一遍
+      if (nextAfter > (account?.events_cursor ?? 0)) {
+        await ctx.db
+          .prepare("UPDATE accounts SET events_cursor = ? WHERE id = ? AND events_cursor < ?")
+          .bind(nextAfter, ctx.auth.accountId, nextAfter)
+          .run();
+      }
       return {
         events: page.map((e) => ({
           seq: e.seq,
           type: e.type,
-          audience: e.audience,
           application_id: e.application_id,
           ...parseJson<Record<string, unknown>>(e.payload, {}),
           created_at: e.created_at,
         })),
-        next_after: page[page.length - 1]?.seq ?? input.after ?? 0,
+        next_after: nextAfter,
         has_more: results.length > limit,
       };
     },
@@ -777,7 +823,7 @@ export const applicationOps = [
         search: { limit_per_minute: l.searchPerMin },
         events_poll: { limit_per_minute: l.pollPerMin },
       };
-      if (ctx.auth.scopes.has("candidate:apply") || ctx.auth.scopes.has("candidate:read")) {
+      if (ctx.auth.role === "candidate") {
         const used = await appliedToday(ctx.db, ctx.auth.accountId);
         out.applications = { limit: l.applyPerDay, used, remaining: Math.max(0, l.applyPerDay - used), reset_at: day.end };
       }
@@ -809,4 +855,75 @@ export async function resumePdfForApplication(ctx: Ctx, applicationId: string) {
   const candidate = await loadCandidate(ctx.db, app.candidate_id);
   if (!candidate?.pdf_key) throw notFound("PDF 简历");
   return { key: candidate.pdf_key, filename: candidate.pdf_name ?? "resume.pdf" };
+}
+
+const EXPIRE_DAYS = 30;
+
+/**
+ * 每天清一次没人管的投递，改成“已关闭”，给双方各发一条事件：
+ * 投递 30 天没等到决定；邀约给的时间全过了还没回应；约好的面试过了 30 天没有结果；录用发出 30 天没回应。
+ */
+export async function expireStale(db: D1Database): Promise<number> {
+  const now = nowIso();
+  const cutoff = new Date(Date.now() - EXPIRE_DAYS * 86400000).toISOString();
+  const cases: { where: string; params: unknown[]; note: string }[] = [
+    {
+      where: "a.status IN ('applied', 'viewed') AND a.created_at < ?",
+      params: [cutoff],
+      note: `${EXPIRE_DAYS} 天没有等到决定，自动结束。`,
+    },
+    {
+      where:
+        "a.status = 'invited' AND NOT EXISTS (SELECT 1 FROM json_each(a.invitation, '$.slots') s WHERE s.value > ?)",
+      params: [now],
+      note: "邀约给出的时间都过了，没有回应，自动结束。",
+    },
+    {
+      where: "a.status = 'accepted' AND a.chosen_slot < ?",
+      params: [cutoff],
+      note: `面试时间过去 ${EXPIRE_DAYS} 天没有结果，自动结束。`,
+    },
+    {
+      where: "a.status = 'offered' AND a.updated_at < ?",
+      params: [cutoff],
+      note: `录用发出 ${EXPIRE_DAYS} 天没有回应，自动结束。`,
+    },
+  ];
+  let closed = 0;
+  for (const c of cases) {
+    const from = "FROM applications a JOIN jobs j ON j.id = a.job_id JOIN companies c ON c.id = j.company_id";
+    const payload = (counterpart: string) =>
+      `json_object('job_id', j.id, 'job_title', j.title, 'counterpart', ${counterpart}, 'status', 'closed', 'note', ?)`;
+    const results = await db.batch([
+      db
+        .prepare(
+          `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
+           SELECT a.id, 'system', a.status, 'closed', ?, ? FROM applications a WHERE ${c.where}`,
+        )
+        .bind(c.note, now, ...c.params),
+      db
+        .prepare(
+          `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
+           SELECT a.candidate_id, 'candidate', 'application.expired', a.id, ${payload("c.name")}, ? ${from}
+           WHERE ${c.where}`,
+        )
+        .bind(c.note, now, ...c.params),
+      db
+        .prepare(
+          `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
+           SELECT c.owner_account_id, 'recruiter', 'application.expired', a.id,
+                  ${payload("COALESCE((SELECT name FROM candidates WHERE account_id = a.candidate_id), '求职者')")}, ? ${from}
+           WHERE ${c.where}`,
+        )
+        .bind(c.note, now, ...c.params),
+      db
+        .prepare(
+          `UPDATE applications AS a SET status = 'closed', closed_by = 'system', ended_at = ?, updated_at = ?,
+             rev = lower(hex(randomblob(8))) WHERE ${c.where}`,
+        )
+        .bind(now, now, ...c.params),
+    ]);
+    closed += results[3]?.meta.changes ?? 0;
+  }
+  return closed;
 }

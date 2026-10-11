@@ -55,6 +55,17 @@ export function beijingDay(now = Date.now()): { start: string; end: string } {
   return { start: new Date(start).toISOString(), end: new Date(start + DAY_MS).toISOString() };
 }
 
+/** 北京时间今天的日期，YYYY-MM-DD。 */
+export function beijingDate(now = Date.now()): string {
+  return new Date(now + BEIJING_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/** “北京市”和“北京”算同一个城市。 */
+export function normCity(city: string): string {
+  const name = city.trim();
+  return name.length > 2 && name.endsWith("市") ? name.slice(0, -1) : name;
+}
+
 export function parseJson<T>(text: string | null | undefined, fallback: T): T {
   if (!text) return fallback;
   try {

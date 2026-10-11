@@ -8,11 +8,11 @@ import {
   EmptyInput,
   ProfileUpdateInput,
   ResumeUploadInput,
-  VisibilityInput,
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
 import { DEGREE_RANK, type Degree } from "../taxonomy";
-import { base64ToBytes, nowIso, parseJson, randomHex } from "../util";
+import { ACTIVE_STATUSES } from "../taxonomy";
+import { base64ToBytes, normCity, nowIso, parseJson, randomHex } from "../util";
 
 export const MAX_PDF_BYTES = 5 * 1024 * 1024;
 
@@ -113,6 +113,23 @@ export function missingForApply(row: CandidateRow | null): string[] {
   return REQUIRED_TO_APPLY.filter((key) => row[key] == null);
 }
 
+/** 招聘者和一批求职者之间最近的一条投递，用来在结果里标出“联系过了”。 */
+async function myContacts(ctx: Ctx, candidateIds: string[]) {
+  const out = new Map<string, { id: string; job_id: string; status: string }>();
+  if (!candidateIds.length) return out;
+  const { results } = await ctx.db
+    .prepare(
+      `SELECT a.id, a.job_id, a.candidate_id, a.status FROM applications a
+       JOIN jobs j ON j.id = a.job_id JOIN companies c ON c.id = j.company_id
+       WHERE c.owner_account_id = ? AND a.candidate_id IN (${placeholders(candidateIds.length)})
+       ORDER BY a.created_at`,
+    )
+    .bind(ctx.auth.accountId, ...candidateIds)
+    .all<{ id: string; job_id: string; candidate_id: string; status: string }>();
+  for (const row of results) out.set(row.candidate_id, { id: row.id, job_id: row.job_id, status: row.status });
+  return out;
+}
+
 export const candidateOps = [
   defineOp({
     name: "profile_get",
@@ -133,7 +150,7 @@ export const candidateOps = [
     name: "profile_update",
     title: "修改我的资料",
     description:
-      "求职者创建或修改自己的资料。只改传入的字段；skills、education、experience、projects、links 这些数组和 expectation 对象是整体替换。只写用户确认过的事实。姓名、学校、学历、毕业年份填齐后才能投递。除手机和邮箱外，其余内容对所有招聘者公开。",
+      "求职者创建或修改自己的资料。只改传入的字段；skills、education、experience、projects、links 这些数组和 expectation 对象是整体替换；专业、城市、简介、手机、邮箱传 null 表示清空。resume_public 控制是否出现在招聘者的搜索里。只写用户确认过的事实。姓名、学校、学历、毕业年份填齐后才能投递。除手机和邮箱外，其余内容对所有招聘者公开。",
     method: "PATCH",
     path: "/me/profile",
     scopes: ["candidate:write"],
@@ -148,22 +165,30 @@ export const candidateOps = [
       const json = <T>(value: T | undefined, current: string | undefined, fallback: string) =>
         value === undefined ? (current ?? fallback) : JSON.stringify(value);
 
+      // undefined 表示不改，null 表示清空
+      const keep = <T>(value: T | null | undefined, current: T | null | undefined) =>
+        value === undefined ? (current ?? null) : value;
+      const expectationInput = input.expectation && {
+        ...input.expectation,
+        ...(input.expectation.cities ? { cities: input.expectation.cities.map(normCity) } : {}),
+      };
       const next = {
         name: input.name ?? old?.name ?? null,
         school: input.school ?? old?.school ?? null,
         degree: input.degree ?? old?.degree ?? null,
-        major: input.major ?? old?.major ?? null,
+        major: keep(input.major, old?.major),
         grad_year: input.grad_year ?? old?.grad_year ?? null,
-        city: input.city ?? old?.city ?? null,
-        summary: input.summary ?? old?.summary ?? null,
+        city: keep(input.city == null ? input.city : normCity(input.city), old?.city),
+        summary: keep(input.summary, old?.summary),
         skills: json(input.skills && [...new Set(input.skills)], old?.skills, "[]"),
         education: json(input.education, old?.education, "[]"),
         experience: json(input.experience, old?.experience, "[]"),
         projects: json(input.projects, old?.projects, "[]"),
         links: json(input.links, old?.links, "[]"),
-        expectation: json(input.expectation, old?.expectation, "{}"),
-        phone: input.phone ?? old?.phone ?? null,
-        email: input.email ?? old?.email ?? null,
+        expectation: json(expectationInput, old?.expectation, "{}"),
+        phone: keep(input.phone, old?.phone),
+        email: keep(input.email, old?.email),
+        resume_public: input.resume_public === undefined ? (old?.resume_public ?? 1) : input.resume_public ? 1 : 0,
       };
       const skills = parseJson<string[]>(next.skills, []);
       const expectation = parseJson<ExpectationData>(next.expectation, {});
@@ -193,8 +218,8 @@ export const candidateOps = [
           .prepare(
             `INSERT INTO candidates (account_id, name, school, degree, degree_rank, major, grad_year, city, summary,
                skills, education, experience, projects, links, expectation, days_per_week, phone, email,
-               search_text, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
+               search_text, created_at, updated_at, resume_public)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20, ?21)
              ON CONFLICT (account_id) DO UPDATE SET
                name = excluded.name, school = excluded.school, degree = excluded.degree,
                degree_rank = excluded.degree_rank, major = excluded.major, grad_year = excluded.grad_year,
@@ -202,7 +227,8 @@ export const candidateOps = [
                education = excluded.education, experience = excluded.experience, projects = excluded.projects,
                links = excluded.links, expectation = excluded.expectation,
                days_per_week = excluded.days_per_week, phone = excluded.phone, email = excluded.email,
-               search_text = excluded.search_text, updated_at = excluded.updated_at`,
+               search_text = excluded.search_text, updated_at = excluded.updated_at,
+               resume_public = excluded.resume_public`,
           )
           .bind(
             id,
@@ -225,6 +251,7 @@ export const candidateOps = [
             next.email,
             searchText,
             now,
+            next.resume_public,
           ),
         db.prepare("DELETE FROM candidate_cities WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM candidate_skills WHERE account_id = ?").bind(id),
@@ -270,25 +297,57 @@ export const candidateOps = [
   }),
 
   defineOp({
-    name: "resume_set_visibility",
-    title: "设置简历是否公开",
+    name: "profile_delete",
+    title: "删除我的资料",
     description:
-      "求职者设置自己是否出现在招聘者的搜索结果里。关闭后招聘者搜不到你，但你已经投递过的岗位，招聘者仍然能看你的简历。",
-    method: "PUT",
-    path: "/me/resume/visibility",
+      "求职者删除自己的全部资料：简历、手机、邮箱、PDF 和订阅。还没结束的投递会被撤回，对应的招聘者会收到事件。删除后不能恢复；之后可以用 profile_update 重新填。执行前先让用户确认。",
+    method: "POST",
+    path: "/me/profile/delete",
     scopes: ["candidate:write"],
     readOnly: false,
+    destructive: true,
     idempotent: true,
-    input: VisibilityInput,
-    handler: async (ctx, input) => {
-      const result = await ctx.db
-        .prepare("UPDATE candidates SET resume_public = ?, updated_at = ? WHERE account_id = ?")
-        .bind(input.public ? 1 : 0, nowIso(), ctx.auth.accountId)
-        .run();
-      if (!result.meta.changes) {
-        throw new HireError("not_found", "你还没有填过资料。先调用 profile_update。");
-      }
-      return { resume_public: input.public };
+    input: EmptyInput,
+    handler: async (ctx) => {
+      const db = ctx.db;
+      const id = ctx.auth.accountId;
+      const old = await loadCandidate(db, id);
+      const now = nowIso();
+      const active = `a.candidate_id = ? AND a.status IN (${placeholders(ACTIVE_STATUSES.length)})`;
+      const [, , withdrawn] = await db.batch([
+        db
+          .prepare(
+            `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
+             SELECT a.id, 'candidate', a.status, 'withdrawn', '求职者删除了资料。', ? FROM applications a WHERE ${active}`,
+          )
+          .bind(now, id, ...ACTIVE_STATUSES),
+        db
+          .prepare(
+            `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
+             SELECT c.owner_account_id, 'recruiter', 'application.withdrawn', a.id,
+                    json_object('job_id', j.id, 'job_title', j.title, 'counterpart', '求职者', 'status', 'withdrawn',
+                                'note', '求职者删除了资料。'), ?
+             FROM applications a JOIN jobs j ON j.id = a.job_id JOIN companies c ON c.id = j.company_id
+             WHERE ${active}`,
+          )
+          .bind(now, id, ...ACTIVE_STATUSES),
+        db
+          .prepare(
+            `UPDATE applications AS a SET status = 'withdrawn', closed_by = 'candidate', ended_at = ?, updated_at = ?,
+               rev = lower(hex(randomblob(8))), custom_resume = NULL, answers = NULL
+             WHERE ${active}`,
+          )
+          .bind(now, now, id, ...ACTIVE_STATUSES),
+        db.prepare("UPDATE applications SET custom_resume = NULL, answers = NULL WHERE candidate_id = ?").bind(id),
+        db.prepare("DELETE FROM candidate_cities WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM candidate_skills WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM candidate_recruit_types WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM candidates_fts WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM subscriptions WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM candidates WHERE account_id = ?").bind(id),
+      ]);
+      if (old?.pdf_key) await ctx.env.FILES.delete(old.pdf_key);
+      return { deleted: old != null, withdrawn_applications: withdrawn?.meta.changes ?? 0 };
     },
   }),
 
@@ -296,7 +355,7 @@ export const candidateOps = [
     name: "candidates_search",
     title: "搜索求职者",
     description:
-      "招聘者按条件搜索公开了简历的求职者，返回摘要列表，按更新时间从新到旧排列。服务端只做条件过滤，不打分。每条结果带 active_at（最近活跃时间），active_within_days 可以只看近期活跃的人。结果里没有手机和邮箱，联系方式要等对方接受邀约后才能看到。",
+      "招聘者按条件搜索公开了简历的求职者，返回摘要列表，按注册时间从新到旧排列。服务端只做条件过滤，不打分。每条结果带 active_at（最近活跃时间）和 my_application（你和他之间最近一条投递的编号、岗位和状态，没有则为 null）；active_within_days 可以只看近期活跃的人。结果里没有手机和邮箱，联系方式要等对方接受邀约后才能看到。",
     method: "GET",
     path: "/candidates",
     scopes: ["recruiter:read"],
@@ -313,7 +372,7 @@ export const candidateOps = [
       }
       if (input.city) {
         where.clauses.push("EXISTS (SELECT 1 FROM candidate_cities cc WHERE cc.account_id = c.account_id AND cc.city = ?)");
-        where.params.push(input.city);
+        where.params.push(normCity(input.city));
       }
       if (input.degree) {
         where.clauses.push("c.degree_rank >= ?");
@@ -343,18 +402,22 @@ export const candidateOps = [
         idCol: "c.account_id",
         textCol: "c.search_text",
       });
-      addCursor(where, input.cursor, "c.updated_at", "c.account_id");
+      addCursor(where, input.cursor, "c.created_at", "c.account_id");
 
       const limit = input.limit ?? 20;
       const { results } = await ctx.db
         .prepare(
           `SELECT c.* FROM candidates c WHERE ${where.clauses.join(" AND ")}
-           ORDER BY c.updated_at DESC, c.account_id DESC LIMIT ?`,
+           ORDER BY c.created_at DESC, c.account_id DESC LIMIT ?`,
         )
         .bind(...where.params, limit + 1)
         .all<CandidateRow>();
-      const { page, next_cursor } = paginate(results, limit, (row) => [row.updated_at, row.account_id]);
-      return { candidates: page.map(candidateSummary), next_cursor };
+      const { page, next_cursor } = paginate(results, limit, (row) => [row.created_at, row.account_id]);
+      const mine = await myContacts(ctx, page.map((row) => row.account_id));
+      return {
+        candidates: page.map((row) => ({ ...candidateSummary(row), my_application: mine.get(row.account_id) ?? null })),
+        next_cursor,
+      };
     },
   }),
 
@@ -382,7 +445,8 @@ export const candidateOps = [
           .first();
         if (!related) throw notFound("求职者");
       }
-      return { candidate: candidatePublic(row) };
+      const mine = await myContacts(ctx, [row.account_id]);
+      return { candidate: { ...candidatePublic(row), my_application: mine.get(row.account_id) ?? null } };
     },
   }),
 ];

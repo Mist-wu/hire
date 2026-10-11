@@ -152,51 +152,49 @@ describe("OAuth", () => {
     const denied = await consent(start.requestId, start.cookie, "deny");
     expect(denied.location.searchParams.get("error")).toBe("access_denied");
     expect(denied.location.searchParams.get("code")).toBeNull();
-
-    // 指定了 resource 的连接器只能授权对应身份
-    const fixed = await startAuthorize(client.client_id, challenge, `&resource=${encodeURIComponent(`${BASE}/mcp/recruiter`)}`);
-    const mismatch = await consent(fixed.requestId, fixed.cookie, "approve", ["candidate"]);
-    expect(mismatch.html).not.toContain('value="candidate"');
-    expect(mismatch.html).toContain('value="recruiter"');
-    expect(mismatch.location.searchParams.get("error")).toBe("access_denied");
   });
 
-  it("固定身份的连接器只拿到那种身份的范围，即使客户端申请了全部", async () => {
-    mockGithub({ id: 4545, login: "pi-user" });
-    const unauth = await SELF.fetch(`${BASE}/mcp/candidate`, { method: "POST", body: "{}" });
-    const metaUrl = /resource_metadata="([^"]+)"/.exec(unauth.headers.get("WWW-Authenticate") ?? "")?.[1];
-    expect(metaUrl).toBe(`${BASE}/.well-known/oauth-protected-resource/mcp/candidate`);
-    const meta = await (await SELF.fetch(metaUrl!)).json<any>();
-    expect(meta).toMatchObject({ resource: `${BASE}/mcp/candidate`, scopes_supported: ["candidate:read", "candidate:write", "candidate:apply"] });
-
-    const client = (await register()).data;
-    const { verifier, challenge } = await pkce();
-    const all = "candidate:read candidate:write candidate:apply recruiter:read recruiter:write recruiter:invite";
-    const start = await startAuthorize(client.client_id, challenge, `&scope=${encodeURIComponent(all)}&resource=${encodeURIComponent(`${BASE}/mcp/candidate`)}`);
-    const done = await consent(start.requestId, start.cookie, "approve", ["candidate", "recruiter"]);
-    expect(done.html).not.toContain("发布和关闭岗位");
-    const issued = await token({ grant_type: "authorization_code", code: done.location.searchParams.get("code")!, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
-    expect(issued.data.scope).toBe("candidate:read candidate:write candidate:apply");
-  });
-
-  it("通用地址上可以勾选身份：两个都选、只选一个、一个都不选", async () => {
+  it("第一次登录二选一，选定后不能换身份", async () => {
     mockGithub({ id: 4646, login: "chooser" });
     const client = (await register()).data;
     const { verifier, challenge } = await pkce();
-    const grant = async (roles: string[]) => {
-      const start = await startAuthorize(client.client_id, challenge);
+    const grant = async (roles: string[], extra = "") => {
+      const start = await startAuthorize(client.client_id, challenge, extra);
       const done = await consent(start.requestId, start.cookie, "approve", roles);
       const code = done.location.searchParams.get("code");
       if (!code) return { html: done.html, error: done.location.searchParams.get("error") };
       const issued = await token({ grant_type: "authorization_code", code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
-      return { html: done.html, scope: issued.data.scope as string };
+      return { html: done.html, scope: issued.data.scope as string, token: issued.data.access_token as string };
     };
-    const both = await grant(["candidate", "recruiter"]);
-    expect(both.html).toContain('type="checkbox" name="role" value="candidate" checked');
-    expect(both.scope).toBe("candidate:read candidate:write candidate:apply recruiter:read recruiter:write recruiter:invite");
-    expect((await grant(["recruiter"])).scope).toBe("recruiter:read recruiter:write recruiter:invite");
-    expect((await grant([])).error).toBe("access_denied");
+    const none = await grant([]);
+    expect(none.html).toContain('type="radio" name="role" value="candidate" required');
+    expect(none.html).toContain("身份选定后不能更改");
+    expect(none.error).toBe("access_denied");
     expect((await grant(["admin"])).error).toBe("access_denied");
+
+    const first = await grant(["recruiter"]);
+    expect(first.scope).toBe("recruiter:read recruiter:write recruiter:invite");
+
+    // 再登录时不用选，也选不了另一种
+    const again = await grant(["candidate"]);
+    expect(again.html).not.toContain('type="radio"');
+    expect(again.html).not.toContain('value="candidate"');
+    expect(again.scope).toBeUndefined();
+    expect((await grant(["recruiter"])).scope).toBe("recruiter:read recruiter:write recruiter:invite");
+
+    // 客户端只申请另一种身份的范围：直接告知不行
+    const other = await grant(["candidate"], `&scope=${encodeURIComponent("candidate:read candidate:apply")}`);
+    expect(other.html).toContain("已经是招聘者");
+
+    // 设备码登录同样受限
+    const post = async (scope: string) => {
+      const res = await SELF.fetch(`${BASE}/oauth/device/code`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope }) });
+      return res.json<any>();
+    };
+    expect((await post("candidate:read recruiter:read")).error).toBe("invalid_scope");
+    const started = await post("candidate:read");
+    const denied = await token({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: started.device_code });
+    expect(denied.data.error).toBe("access_denied");
   });
 
   it("授权请求不合法时不跳转到未登记的地址", async () => {

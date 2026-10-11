@@ -30,6 +30,8 @@ export const ROLE_SCOPES: Record<Role, Scope[]> = {
 export interface Auth {
   accountId: string;
   login: string;
+  /** 账号的身份。一个账号只能是求职者或招聘者，第一次登录时选定 */
+  role: Role | null;
   scopes: Set<Scope>;
 }
 
@@ -40,6 +42,10 @@ export interface Ctx {
   origin: string;
 }
 
-export function hasRole(auth: Auth, role: Role): boolean {
-  return ROLE_SCOPES[role].some((s) => auth.scopes.has(s));
+export const ROLE_NAMES: Record<Role, string> = { candidate: "求职者", recruiter: "招聘者" };
+
+/** 一组范围属于哪种身份。两种都有返回 "mixed"，一个都没有返回 null。 */
+export function roleOfScopes(scopes: Scope[]): Role | "mixed" | null {
+  const roles = (["candidate", "recruiter"] as Role[]).filter((role) => scopes.some((s) => s.startsWith(`${role}:`)));
+  return roles.length > 1 ? "mixed" : (roles[0] ?? null);
 }

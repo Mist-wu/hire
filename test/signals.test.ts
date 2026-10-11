@@ -18,14 +18,16 @@ describe("活跃度", () => {
     expect(found.data.jobs[0].recruiter_active_at).toBeTruthy();
 
     const before = await api("GET", `/jobs/${job.id}`, seeker);
-    expect(before.data.job.recruiter).toMatchObject({ applications_90d: 0, response_rate: null });
+    expect(before.data.job.recruiter).toMatchObject({ applications_90d: 0, decision_rate: null });
 
     const appId = (await api("POST", "/applications", seeker, { job_id: job.id })).data.application.id;
-    expect((await api("GET", `/jobs/${job.id}`, seeker)).data.job.recruiter).toMatchObject({ applications_90d: 1, response_rate: 0 });
+    // 只是查看不算做出决定
     await api("GET", `/applications/${appId}`, hr);
+    expect((await api("GET", `/jobs/${job.id}`, seeker)).data.job.recruiter).toMatchObject({ applications_90d: 1, decision_rate: 0 });
+    await api("POST", "/invitations", hr, { application_id: appId, mode: "online", slots: [future(1)] });
     const after = (await api("GET", `/jobs/${job.id}`, seeker)).data.job.recruiter;
-    expect(after).toMatchObject({ applications_90d: 1, response_rate: 1 });
-    expect(after.avg_response_hours).toBeGreaterThanOrEqual(0);
+    expect(after).toMatchObject({ applications_90d: 1, decision_rate: 1 });
+    expect(after.avg_decision_hours).toBeGreaterThanOrEqual(0);
 
     const people = await api("GET", "/candidates?skills=Rust&active_within_days=1&limit=50", hr);
     const me = people.data.candidates.find((c: any) => c.id === candidateId);
@@ -34,11 +36,13 @@ describe("活跃度", () => {
 
   it("没活跃过的招聘者会被 active_within_days 滤掉", async () => {
     const { hr, seeker, job } = await setup();
-    // 两种身份都能调的接口不算活跃，这里只有发岗位算过一次；直接把时间改旧
+    // 挂着拉事件不算活跃，主动操作才算
     const { env } = await import("cloudflare:test");
     await (env as any).DB.prepare("UPDATE companies SET active_at = ? WHERE id = ?").bind("2020-01-01T00:00:00.000Z", job.company.id).run();
     expect((await api("GET", `/jobs?company_id=${job.company.id}&active_within_days=7`, seeker)).data.jobs).toHaveLength(0);
     await api("GET", "/events", hr);
+    expect((await api("GET", `/jobs?company_id=${job.company.id}&active_within_days=7`, seeker)).data.jobs).toHaveLength(0);
+    await api("GET", "/company", hr);
     expect((await api("GET", `/jobs?company_id=${job.company.id}&active_within_days=7`, seeker)).data.jobs).toHaveLength(1);
   });
 });
@@ -95,17 +99,19 @@ describe("订阅", () => {
     expect(first.data.events[0]).toMatchObject({
       type: "job.matched", application_id: null, job_id: match.id, job_title: "深圳岗位", subscription_id: subId,
     });
-    const again = await api("GET", "/events", seeker);
-    expect(again.data.events).toHaveLength(1);
+    expect((await api("GET", "/events", seeker)).data.events).toHaveLength(0);
+    expect((await api("GET", "/events?after=0", seeker)).data.events).toHaveLength(1);
 
     expect((await api("GET", "/subscriptions", seeker)).data.subscriptions).toHaveLength(1);
     const other = await login(unique("seeker"), CANDIDATE);
     expect((await api("POST", `/subscriptions/${subId}/delete`, other)).status).toBe(404);
     expect((await api("POST", `/subscriptions/${subId}/delete`, seeker)).status).toBe(200);
-    for (let i = 0; i < 5; i++) {
-      expect((await api("POST", "/subscriptions", seeker, { name: `订阅 ${i}`, filters: { city: "北京" } })).status).toBe(200);
+    const cities = ["北京", "上海", "广州", "杭州", "成都"];
+    for (const city of cities) {
+      expect((await api("POST", "/subscriptions", seeker, { name: city, filters: { city } })).status).toBe(200);
     }
-    expect((await api("POST", "/subscriptions", seeker, { name: "第六个", filters: { city: "北京" } })).status).toBe(422);
+    expect((await api("POST", "/subscriptions", seeker, { name: "重复", filters: { city: "北京" } })).data.error.message).toContain("条件相同");
+    expect((await api("POST", "/subscriptions", seeker, { name: "第六个", filters: { city: "武汉" } })).status).toBe(422);
   });
 });
 
@@ -171,7 +177,7 @@ describe("岗位数据", () => {
     expect(stats.data).toMatchObject({
       detail_views: 1,
       applications: { total: 5, by_candidate: 4, by_recruiter: 1 },
-      funnel: { applied: 4, responded: 3, invited: 2, accepted: 1, offered: 1, hired: 0 },
+      funnel: { applied: 4, viewed: 0, decided: 3, invited: 2, accepted: 1, offered: 1, hired: 0 },
       current: { offered: 1, rejected: 2, applied: 1, invited: 1 },
       reject_reasons: { skills_mismatch: 2 },
     });

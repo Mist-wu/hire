@@ -1,10 +1,10 @@
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import { ROLE_SCOPES, SCOPES, type Env, type Role, type Scope } from "../env";
+import { ROLE_NAMES, ROLE_SCOPES, SCOPES, roleOfScopes, type Env, type Role, type Scope } from "../env";
 import { HireError } from "../errors";
 import { escapeHtml, isoAfter, newId, nowIso, parseJson, randomHex, safeEqual, sha256Base64url, sha256Hex } from "../util";
 import { authorizeUrl, exchangeCode, getUser, githubConfig, pollDevice, startDevice } from "./github";
-import { issueTokens, parseScopes, upsertAccount } from "./tokens";
+import { accountRole, claimRole, issueTokens, parseScopes, upsertAccount } from "./tokens";
 
 type C = Context<{ Bindings: Env }>;
 
@@ -19,7 +19,7 @@ const SCOPE_LABELS: Record<Scope, string> = {
   "candidate:apply": "投递、撤回、回应邀约",
   "recruiter:read": "搜索求职者、查看投递",
   "recruiter:write": "修改公司、发布和关闭岗位",
-  "recruiter:invite": "发邀约、拒绝投递",
+  "recruiter:invite": "发邀约、发录用、拒绝投递",
 };
 
 function oauthError(c: C, error: string, description: string, status: 400 | 401 | 503 = 400) {
@@ -44,20 +44,6 @@ async function body(c: C): Promise<Record<string, string>> {
   } catch {
     return {};
   }
-}
-
-function roleOfResource(resource: string | null | undefined): Role | null {
-  if (!resource) return null;
-  if (/\/mcp\/candidate\/?$/.test(resource)) return "candidate";
-  if (/\/mcp\/recruiter\/?$/.test(resource)) return "recruiter";
-  return null;
-}
-
-/** 客户端申请的范围。连接器地址固定了身份时，只保留那种身份的范围。 */
-function requestedScopes(request: { scopes: string | null; resource: string | null }): Scope[] {
-  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
-  const role = roleOfResource(request.resource);
-  return role ? requested.filter((s) => ROLE_SCOPES[role].includes(s)) : requested;
 }
 
 function isLoopback(url: URL): boolean {
@@ -139,18 +125,18 @@ function failPage(message: string): Response {
   return page("授权失败", `<h1>授权失败</h1><p class="muted">${escapeHtml(message)}</p>`, 400);
 }
 
-const ROLE_NAMES: Record<Role, string> = { candidate: "求职者", recruiter: "招聘者" };
-
-/** 这次授权最多能给哪些范围：客户端申请的，没申请就是全部，再按连接器地址收窄。 */
-function grantable(request: { scopes: string | null; resource: string | null }): Scope[] {
-  const requested = requestedScopes(request);
-  if (requested.length) return requested;
-  const role = roleOfResource(request.resource);
-  return role ? ROLE_SCOPES[role] : [...SCOPES];
+/** 这次授权最多能给哪些范围：客户端申请的，没申请就是全部。 */
+function grantable(request: { scopes: string | null }): Scope[] {
+  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
+  return requested.length ? requested : [...SCOPES];
 }
 
 function rolesIn(scopes: Scope[]): Role[] {
   return (["candidate", "recruiter"] as Role[]).filter((role) => scopes.some((s) => s.startsWith(`${role}:`)));
+}
+
+function wrongRole(actual: Role): string {
+  return `这个 GitHub 账号已经是${ROLE_NAMES[actual]}，不能再用另一种身份登录。一个账号只能有一种身份。`;
 }
 
 interface AuthRequestRow {
@@ -201,12 +187,10 @@ oauth.get("/.well-known/openid-configuration", (c) => c.json(metadata(c)));
 
 function protectedResource(c: C) {
   const base = origin(c);
-  const suffix = new URL(c.req.url).pathname.replace("/.well-known/oauth-protected-resource", "");
-  const role = roleOfResource(suffix);
   return c.json({
-    resource: `${base}${suffix || "/mcp"}`,
+    resource: `${base}/mcp`,
     authorization_servers: [base],
-    scopes_supported: role ? ROLE_SCOPES[role] : SCOPES,
+    scopes_supported: SCOPES,
     bearer_methods_supported: ["header"],
     resource_name: "hire",
   });
@@ -327,8 +311,11 @@ oauth.get("/oauth/github/callback", async (c) => {
   const client = await c.env.DB.prepare("SELECT name FROM oauth_clients WHERE id = ?")
     .bind(request.client_id)
     .first<{ name: string | null }>();
-  const scopes = grantable(request);
+  // 账号已有身份时只能用那个身份；还没有时在这一页选定
+  const fixed = await accountRole(c.env.DB, accountId);
+  const scopes = grantable(request).filter((s) => !fixed || ROLE_SCOPES[fixed].includes(s));
   const roles = rolesIn(scopes);
+  if (!roles.length) return failPage(wrongRole(fixed!));
   const clientName = escapeHtml(client?.name ?? "未命名客户端");
   let host = request.redirect_uri;
   try {
@@ -341,10 +328,10 @@ oauth.get("/oauth/github/callback", async (c) => {
       .filter((s) => s.startsWith(`${role}:`))
       .map((s) => SCOPE_LABELS[s])
       .join("；");
-    // 两种身份都可选时用复选框；只有一种时不需要选
+    // 两种身份都可选时二选一；只有一种时不需要选
     const input =
       roles.length > 1
-        ? `<input type="checkbox" name="role" value="${role}" checked>`
+        ? `<input type="radio" name="role" value="${role}" required>`
         : `<input type="hidden" name="role" value="${role}">`;
     return `<label class="role">${input}<span><b>${ROLE_NAMES[role]}</b><span class="muted">${escapeHtml(can)}</span></span></label>`;
   };
@@ -355,7 +342,7 @@ oauth.get("/oauth/github/callback", async (c) => {
 <input type="hidden" name="request_id" value="${escapeHtml(request.id)}">
 <input type="hidden" name="csrf" value="${escapeHtml(request.csrf)}">
 <h1>${clientName} 请求访问你的账号</h1>
-<p class="muted">${escapeHtml(user.login)} · 授权后跳转到 ${escapeHtml(host)}</p>
+<p class="muted">${escapeHtml(user.login)} · 授权后跳转到 ${escapeHtml(host)}${roles.length > 1 ? " · 身份选定后不能更改" : ""}</p>
 <div class="roles">${roles.map(roleRow).join("")}</div>
 <div class="actions"><button name="decision" value="approve" class="primary">授权</button><button name="decision" value="deny">拒绝</button></div>
 </form>`,
@@ -372,15 +359,17 @@ oauth.post("/oauth/consent", async (c) => {
   await c.env.DB.prepare("DELETE FROM auth_requests WHERE id = ?").bind(request.id).run();
   deleteCookie(c, COOKIE, { path: "/oauth" });
 
-  // 只发页面上列出过、并且用户勾选了身份的那些范围
-  const chosen = [form.role].flat().filter((r): r is string => typeof r === "string");
+  // 只发页面上列出过、并且属于所选身份的那些范围
+  const chosen = field("role") as Role;
   const scopes =
-    field("decision") === "approve"
-      ? grantable(request).filter((s) => chosen.includes(s.split(":")[0]!))
+    field("decision") === "approve" && (chosen === "candidate" || chosen === "recruiter")
+      ? grantable(request).filter((s) => ROLE_SCOPES[chosen].includes(s))
       : [];
   if (!scopes.length) {
     return c.redirect(redirectWith(request.redirect_uri, { error: "access_denied", state: request.state }), 303);
   }
+  const actual = await claimRole(c.env.DB, request.account_id, chosen);
+  if (actual !== chosen) return failPage(wrongRole(actual));
   const code = `hire_ac_${randomHex(32)}`;
   await c.env.DB.prepare(
     `INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scopes, expires_at)
@@ -445,7 +434,12 @@ async function deviceGrant(c: C, form: Record<string, string>) {
   if (!user) return oauthError(c, "invalid_grant", "向 GitHub 确认身份失败。");
   await drop();
   const accountId = await upsertAccount(c.env.DB, user.id, user.login);
-  const tokens = await issueTokens(c.env.DB, accountId, parseScopes(parseJson<string[]>(row.scopes, [])), null);
+  const scopes = parseScopes(parseJson<string[]>(row.scopes, []));
+  const role = roleOfScopes(scopes);
+  if (role === null || role === "mixed") return oauthError(c, "invalid_scope", "scope 只能包含一种身份的范围。");
+  const actual = await claimRole(c.env.DB, accountId, role);
+  if (actual !== role) return oauthError(c, "access_denied", wrongRole(actual));
+  const tokens = await issueTokens(c.env.DB, accountId, scopes, null);
   return c.json(tokens, 200, { "Cache-Control": "no-store" });
 }
 
@@ -520,11 +514,11 @@ oauth.post("/oauth/token", async (c) => {
 oauth.post("/oauth/device/code", async (c) => {
   const form = await body(c);
   const scopes = parseScopes(form.scope ?? "");
-  if (!scopes.length) {
+  if (roleOfScopes(scopes) === null || roleOfScopes(scopes) === "mixed") {
     return oauthError(
       c,
       "invalid_scope",
-      `scope 必填，用空格分隔。求职者用 "${ROLE_SCOPES.candidate.join(" ")}"，招聘者用 "${ROLE_SCOPES.recruiter.join(" ")}"。`,
+      `scope 必填，用空格分隔，只能包含一种身份的范围。求职者用 "${ROLE_SCOPES.candidate.join(" ")}"，招聘者用 "${ROLE_SCOPES.recruiter.join(" ")}"。`,
     );
   }
   let started;
@@ -568,8 +562,13 @@ oauth.post("/oauth/dev/token", async (c) => {
   const form = await body(c);
   const login = (form.login ?? "").trim();
   if (!/^[\w-]{1,39}$/.test(login)) return oauthError(c, "invalid_request", "login 必填，只能包含字母、数字、下划线和连字符。");
-  const scopes = form.scope ? parseScopes(form.scope) : [...SCOPES];
   const digest = await sha256Hex(`dev:${login.toLowerCase()}`);
   const accountId = await upsertAccount(c.env.DB, -Number.parseInt(digest.slice(0, 12), 16), login);
+  const existing = await accountRole(c.env.DB, accountId);
+  const scopes = form.scope ? parseScopes(form.scope) : existing ? ROLE_SCOPES[existing] : [];
+  const role = roleOfScopes(scopes);
+  if (role === null || role === "mixed") return oauthError(c, "invalid_scope", "scope 只能包含一种身份的范围。");
+  const actual = await claimRole(c.env.DB, accountId, role);
+  if (actual !== role) return oauthError(c, "access_denied", wrongRole(actual));
   return c.json(await issueTokens(c.env.DB, accountId, scopes, null), 200, { "Cache-Control": "no-store" });
 });

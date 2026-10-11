@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import type { Env, Role } from "./env";
+import type { Env } from "./env";
 import { HireError } from "./errors";
 import { OPS, opsFor, requireScope, touchActive } from "./ops";
 import { inputSchema, makeCtx } from "./rest";
@@ -10,11 +10,11 @@ type C = Context<{ Bindings: Env }>;
 const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INFO = { name: "hire", title: "hire 招聘平台", version: "0.1.0" };
 
-const INSTRUCTIONS = `hire 是给 AI agent 用的招聘平台，没有网页。你代表一位求职者或招聘者操作。
+const INSTRUCTIONS = `hire 是给 AI agent 用的招聘平台，没有网页。一个账号只有一种身份：求职者或招聘者，你能看到的工具就是这个身份能用的。
 求职者：先 profile_get 看资料，缺什么用 profile_update 补；用 jobs_search 按硬条件过滤，再用 job_get 读详情自己判断；岗位有筛选问题时先问用户再 application_create 投递；想持续关注就 subscription_create 订阅。
 招聘者：先 company_get，没有公司就 company_upsert；job_create 发岗位；job_applications_list 和 application_get 看投递；invitation_create 发邀约；面试后 offer_create 发录用或 application_reject 拒绝；job_stats 看数据。
-双方用 events_poll 了解进展，有未结束的投递或订阅时每 10 分钟一次即可。
-投递、回应邀约、发邀约、发录用、回应录用、拒绝、关闭岗位都会被对方看到且不能撤销，执行前先让用户确认。
+用 events_poll 了解进展，直接调用就只返回新事件。有未结束的投递或订阅时每 10 分钟一次即可。
+投递、回应邀约、发邀约、发录用、回应录用、拒绝、撤回、关闭岗位、删除资料都会被对方看到或不能撤销，执行前先让用户确认。
 简历里只写用户确认过的事实。遇到 quota_exceeded 就停下，不要重试。`;
 
 interface RpcRequest {
@@ -46,14 +46,12 @@ function toolDef(op: (typeof OPS)[number]) {
 
 export function unauthorized(c: C, err: HireError): Response {
   const url = new URL(c.req.url);
-  // 每个 MCP 地址有自己的资源元数据，客户端据此知道该申请哪种身份的范围
-  const suffix = /^\/mcp(\/(candidate|recruiter))?$/.test(url.pathname) ? url.pathname : "";
   return c.json(err.toJSON(), 401, {
-    "WWW-Authenticate": `Bearer realm="hire", resource_metadata="${url.origin}/.well-known/oauth-protected-resource${suffix}"`,
+    "WWW-Authenticate": `Bearer realm="hire", resource_metadata="${url.origin}/.well-known/oauth-protected-resource/mcp"`,
   });
 }
 
-export async function handleMcp(c: C, role?: Role): Promise<Response> {
+export async function handleMcp(c: C): Promise<Response> {
   if (c.req.method !== "POST") {
     // 无状态服务：不提供服务端推送的 GET 流，也没有会话可删
     return c.json(rpcError(null, -32000, "这个端点只接受 POST。"), 405, { Allow: "POST" });
@@ -94,12 +92,11 @@ export async function handleMcp(c: C, role?: Role): Promise<Response> {
       case "ping":
         return ok({});
       case "tools/list":
-        return ok({ tools: opsFor(ctx.auth, role).map(toolDef) });
+        return ok({ tools: opsFor(ctx.auth).map(toolDef) });
       case "tools/call": {
         const name = req.params?.name;
         const op = OPS.find((o) => o.name === name);
-        const wrongRole = role && op && op.scopes.length > 0 && !op.scopes.some((s) => s.startsWith(`${role}:`));
-        if (!op || wrongRole) {
+        if (!op) {
           return rpcError(req.id, -32602, `没有名为 ${String(name)} 的工具。`);
         }
         try {

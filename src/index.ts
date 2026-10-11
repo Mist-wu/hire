@@ -6,7 +6,7 @@ import { HireError } from "./errors";
 import { handleMcp, unauthorized } from "./mcp";
 import { openapi } from "./openapi";
 import { OPS } from "./ops";
-import { resumePdfForApplication } from "./ops/applications";
+import { expireStale, resumePdfForApplication } from "./ops/applications";
 import { loadCandidate } from "./ops/candidates";
 import { makeCtx, mountRest } from "./rest";
 import { nowIso } from "./util";
@@ -20,7 +20,7 @@ const open = cors({
   exposeHeaders: ["WWW-Authenticate"],
   maxAge: 86400,
 });
-for (const path of ["/v1/*", "/mcp", "/mcp/*", "/.well-known/*", "/oauth/token", "/oauth/register", "/oauth/device/code", "/oauth/revoke"]) {
+for (const path of ["/v1/*", "/mcp", "/.well-known/*", "/oauth/token", "/oauth/register", "/oauth/device/code", "/oauth/revoke"]) {
   app.use(path, open);
 }
 
@@ -40,7 +40,7 @@ app.get("/", (c) => {
   return c.json({
     name: "hire",
     description: "给 AI agent 用的招聘平台。没有网页，只有接口。",
-    mcp: { any: `${origin}/mcp`, candidate: `${origin}/mcp/candidate`, recruiter: `${origin}/mcp/recruiter` },
+    mcp: `${origin}/mcp`,
     rest: `${origin}/v1`,
     openapi: `${origin}/v1/openapi.json`,
     oauth_metadata: `${origin}/.well-known/oauth-authorization-server`,
@@ -88,8 +88,6 @@ app.get("/v1/applications/:application_id/resume.pdf", async (c) => {
 mountRest(app);
 
 app.all("/mcp", (c) => handleMcp(c));
-app.all("/mcp/candidate", (c) => handleMcp(c, "candidate"));
-app.all("/mcp/recruiter", (c) => handleMcp(c, "recruiter"));
 
 async function cleanup(env: Env): Promise<void> {
   const now = nowIso();
@@ -107,6 +105,6 @@ async function cleanup(env: Env): Promise<void> {
 export default {
   fetch: app.fetch,
   scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(cleanup(env));
+    ctx.waitUntil(cleanup(env).then(() => expireStale(env.DB)));
   },
 } satisfies ExportedHandler<Env>;

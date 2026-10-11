@@ -1,4 +1,4 @@
-import { hasRole, type Auth, type Ctx, type Role } from "../env";
+import type { Auth, Ctx } from "../env";
 import { HireError } from "../errors";
 import type { Op } from "../registry";
 import { applicationOps } from "./applications";
@@ -10,7 +10,7 @@ const ORDER = [
   "profile_get",
   "profile_update",
   "resume_upload",
-  "resume_set_visibility",
+  "profile_delete",
   "jobs_search",
   "job_get",
   "subscription_create",
@@ -59,31 +59,23 @@ export function requireScope(op: Op, auth: Auth): void {
   }
 }
 
-/** /mcp/candidate 和 /mcp/recruiter 只列出对应身份的工具。 */
-export function opsFor(auth: Auth, role?: Role): Op[] {
-  return OPS.filter((op) => {
-    if (!allowed(op, auth)) return false;
-    if (!role || op.scopes.length === 0) return true;
-    return op.scopes.some((s) => s.startsWith(`${role}:`) && auth.scopes.has(s));
-  });
+/** 工具列表只列这个令牌能调的。 */
+export function opsFor(auth: Auth): Op[] {
+  return OPS.filter((op) => allowed(op, auth));
 }
 
 const ACTIVE_STEP_MS = 3600 * 1000;
+/** 定时拉事件和查限额不算活跃，不然挂着轮询就永远“刚刚活跃”。 */
+const PASSIVE_OPS = ["events_poll", "quota_get"];
 
-/**
- * 记下这个账号以哪个身份活跃过。只认身份明确的调用：单一身份的工具算那个身份，
- * 不限身份的（拉事件、查限额）算令牌带的全部身份。一小时内只写一次。
- */
+/** 记下这个账号最近一次主动操作的时间。一小时内只写一次。 */
 export async function touchActive(ctx: Ctx, op: Op): Promise<void> {
-  const roles = (["candidate", "recruiter"] as Role[]).filter(
-    (role) => hasRole(ctx.auth, role) && op.scopes.every((s) => s.startsWith(`${role}:`)),
-  );
-  if (!roles.length) return;
+  if (!ctx.auth.role || PASSIVE_OPS.includes(op.name)) return;
   const now = new Date();
   const stale = new Date(now.getTime() - ACTIVE_STEP_MS).toISOString();
-  const sql = {
-    candidate: "UPDATE candidates SET active_at = ? WHERE account_id = ? AND (active_at IS NULL OR active_at < ?)",
-    recruiter: "UPDATE companies SET active_at = ? WHERE owner_account_id = ? AND (active_at IS NULL OR active_at < ?)",
-  };
-  await ctx.db.batch(roles.map((role) => ctx.db.prepare(sql[role]).bind(now.toISOString(), ctx.auth.accountId, stale)));
+  const sql =
+    ctx.auth.role === "candidate"
+      ? "UPDATE candidates SET active_at = ? WHERE account_id = ? AND (active_at IS NULL OR active_at < ?)"
+      : "UPDATE companies SET active_at = ? WHERE owner_account_id = ? AND (active_at IS NULL OR active_at < ?)";
+  await ctx.db.prepare(sql).bind(now.toISOString(), ctx.auth.accountId, stale).run();
 }

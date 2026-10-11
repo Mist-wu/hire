@@ -4,7 +4,7 @@ import { defineOp } from "../registry";
 import { EmptyInput, type JobFilters, SubscriptionCreateInput, SubscriptionDeleteInput } from "../schemas";
 import type { Where } from "../search";
 import { newId, nowIso, parseJson } from "../util";
-import { addJobFilters, checkSalaryPair } from "./jobs";
+import { addJobFilters, addOpenFilter, checkSalaryPair } from "./jobs";
 
 const MAX_SUBSCRIPTIONS = 5;
 const MATCHES_PER_POLL = 20;
@@ -16,6 +16,11 @@ interface SubRow {
   filters: string;
   cursor_at: string;
   created_at: string;
+}
+
+function sameFilters(a: object, b: object): boolean {
+  const norm = (o: object) => JSON.stringify(Object.entries(o).sort(([x], [y]) => x.localeCompare(y)));
+  return norm(a) === norm(b);
 }
 
 function toApi(row: SubRow) {
@@ -32,7 +37,8 @@ export async function deliverMatches(ctx: Ctx): Promise<void> {
     .bind(ctx.auth.accountId)
     .all<SubRow>();
   for (const sub of subs) {
-    const where: Where = { clauses: ["j.status = 'open'", "j.created_at > ?"], params: [sub.cursor_at] };
+    const where: Where = { clauses: ["j.created_at > ?"], params: [sub.cursor_at] };
+    addOpenFilter(where);
     addJobFilters(where, parseJson<JobFilters>(sub.filters, {}));
     const { results: jobs } = await ctx.db
       .prepare(
@@ -90,11 +96,18 @@ export const subscriptionOps = [
         throw invalid([{ field: "filters", message: "至少传一个搜索条件。" }]);
       }
       checkSalaryPair(input.filters);
-      const count = await ctx.db
-        .prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE account_id = ?")
+      const { results: existing } = await ctx.db
+        .prepare("SELECT * FROM subscriptions WHERE account_id = ?")
         .bind(ctx.auth.accountId)
-        .first<{ n: number }>();
-      if ((count?.n ?? 0) >= MAX_SUBSCRIPTIONS) {
+        .all<SubRow>();
+      const same = existing.find((row) => sameFilters(parseJson<JobFilters>(row.filters, {}), filters));
+      if (same) {
+        throw invalid(
+          [{ field: "filters", message: `和已有的订阅“${same.name}”条件相同。` }],
+          "已经有一个条件相同的订阅，不用再建。",
+        );
+      }
+      if (existing.length >= MAX_SUBSCRIPTIONS) {
         throw invalid(
           [{ field: "name", message: `最多 ${MAX_SUBSCRIPTIONS} 个订阅。` }],
           `订阅已达上限 ${MAX_SUBSCRIPTIONS} 个。先用 subscription_delete 删掉一个。`,

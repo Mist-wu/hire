@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { CANDIDATE, RECRUITER, api, future, internJob, login, profile, setup, unique } from "./helpers";
+import { SELF } from "cloudflare:test";
+import { BASE, CANDIDATE, RECRUITER, api, future, internJob, login, profile, setup, unique } from "./helpers";
 
 describe("校验", () => {
   it("实习岗位必须填每周天数，社招不能填", async () => {
@@ -65,10 +66,12 @@ describe("状态和限制", () => {
   it("别人的投递看不到，也改不了", async () => {
     const { seeker, job } = await setup();
     const appId = (await api("POST", "/applications", seeker, { job_id: job.id })).data.application.id;
-    const stranger = await login(unique("x"));
+    const stranger = await login(unique("x"), RECRUITER);
+    const peer = await login(unique("x"), CANDIDATE);
     expect((await api("GET", `/applications/${appId}`, stranger)).status).toBe(404);
     expect((await api("POST", `/applications/${appId}/reject`, stranger, { reason: "other" })).status).toBe(404);
-    expect((await api("POST", `/applications/${appId}/withdraw`, stranger, {})).status).toBe(404);
+    expect((await api("POST", `/applications/${appId}/withdraw`, peer, {})).status).toBe(404);
+    expect((await api("GET", `/applications/${appId}`, peer)).status).toBe(404);
   });
 
   it("每天投递有上限", async () => {
@@ -136,19 +139,26 @@ describe("权限范围", () => {
     expect(res.data.error.code).toBe("unauthorized");
   });
 
-  it("同一个账号可以同时扮演两边", async () => {
+  it("一个账号只能有一种身份", async () => {
     const name = unique("solo");
     const hr = await login(name, RECRUITER);
-    const seeker = await login(name, CANDIDATE);
-    await api("PUT", "/company", hr, { name: "一人公司" });
-    const job = (await api("POST", "/jobs", hr, internJob)).data.job;
-    await api("PATCH", "/me/profile", seeker, profile);
-    const appId = (await api("POST", "/applications", seeker, { job_id: job.id })).data.application.id;
-    // 求职者自己看不会触发“已查看”
-    expect((await api("GET", `/applications/${appId}`, seeker)).data.application).toMatchObject({ status: "applied", viewing_as: "candidate" });
-    expect((await api("GET", `/applications/${appId}`, hr)).data.application).toMatchObject({ status: "viewed", viewing_as: "recruiter" });
-    const both = await login(name);
-    expect((await api("GET", `/applications/${appId}?as=candidate`, both)).data.application.viewing_as).toBe("candidate");
+    await api("PUT", "/company", hr, { name: unique("一人公司") });
+    const res = await SELF.fetch(`${BASE}/oauth/dev/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login: name, scope: CANDIDATE }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<any>()).error).toBe("access_denied");
+    const mixed = await SELF.fetch(`${BASE}/oauth/dev/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login: unique("mixed"), scope: "candidate:read recruiter:read" }),
+    });
+    expect((await mixed.json<any>()).error).toBe("invalid_scope");
+    // 招聘者碰不到求职者一侧的任何接口
+    expect((await api("PATCH", "/me/profile", hr, profile)).status).toBe(403);
+    expect((await api("POST", "/applications", hr, { job_id: "x" })).status).toBe(403);
   });
 });
 
@@ -205,7 +215,7 @@ describe("搜索", () => {
     const search = () => api("GET", `/candidates?skills=${tag}`, hr);
     expect((await search()).data.candidates).toHaveLength(1);
     expect((await api("GET", `/candidates?q=邮电大学&skills=${tag}`, hr)).data.candidates).toHaveLength(1);
-    await api("PUT", "/me/resume/visibility", seeker, { public: false });
+    await api("PATCH", "/me/profile", seeker, { resume_public: false });
     expect((await search()).data.candidates).toHaveLength(0);
     expect((await api("GET", `/candidates/${id}`, hr)).status).toBe(404);
   });

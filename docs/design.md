@@ -24,25 +24,25 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 ## 账号、身份和令牌
 
-一个账号对应一个 GitHub 用户。账号下可以开两种身份：
+一个账号对应一个 GitHub 用户。一个账号只能有一种身份，第一次登录时选定，之后不能更改：
 
 | 身份 | 能做什么 | 需要先有 |
 |---|---|---|
 | 求职者 `candidate` | 维护资料和简历、搜索岗位、投递、回应邀约 | 无 |
 | 招聘者 `recruiter` | 维护公司、发岗位、搜索求职者、邀约、拒绝 | 一家公司 |
 
-同一个账号可以同时有两种身份。演示时一个 GitHub 账号就能扮两边。
+身份不能兼任，是为了让活跃度和决定比例这些信号可信：同一个人不能自己投自己的岗位、自己邀约自己。想两边都试，要用两个 GitHub 账号。
 
-令牌带权限范围，服务端按范围放行或拒绝。授权时选一种身份，令牌就只有那种身份的三个范围。客户端也可以明确申请其中几个范围，比如只读。
+令牌带权限范围，服务端按范围放行或拒绝。令牌只有账号那种身份的三个范围。客户端也可以明确申请其中几个范围，比如只读。每次请求时，服务端还会按账号的身份再过滤一遍令牌的范围。
 
 | 范围 | 覆盖的动作 |
 |---|---|
 | `candidate:read` | 看自己的资料和投递、搜索和查看岗位 |
-| `candidate:write` | 改资料、传简历、设置简历是否公开 |
-| `candidate:apply` | 投递、撤回、回应邀约 |
+| `candidate:write` | 改资料、传简历、设置简历是否公开、管理订阅、删除资料 |
+| `candidate:apply` | 投递、撤回、回应邀约和录用 |
 | `recruiter:read` | 搜索和查看求职者、看收到的投递 |
 | `recruiter:write` | 改公司、发布、修改和关闭岗位 |
-| `recruiter:invite` | 发出邀约、拒绝 |
+| `recruiter:invite` | 发出邀约和录用、拒绝 |
 
 事件和限额两个接口，任何令牌都能调。
 
@@ -56,18 +56,18 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 1. 客户端打开授权地址，服务端直接跳转到 GitHub。
 2. GitHub 登录后跳回服务端，服务端显示一个授权确认页。
-3. 人在确认页上勾选身份（求职者、招聘者，或两个都要），点授权或拒绝。
+3. 人在确认页上点授权或拒绝。账号第一次登录时，还要在这一页从求职者和招聘者里选一个。
 4. 服务端带着授权码跳回客户端，客户端换令牌。
 
 确认页是 hire 唯一的页面，不能省。客户端可以自行注册，如果没有确认这一步，任何人都能注册一个客户端，再诱导已登录过的用户点一个链接，悄悄拿到他的令牌。确认页上写明是哪个客户端、授权后跳到哪个地址，以及它能做的每一类事。
 
 确认页只能在发起授权的那个浏览器里完成。服务端在第 1 步种一个 cookie，第 2、3 步都要核对它。
 
-令牌拿到的范围按三步算：先取客户端申请的范围，没申请就算全部；再按连接器地址收窄；最后只留用户勾选的身份。很多客户端会直接申请服务端支持的全部范围，所以后两步不能省。
+令牌拿到的范围按两步算：先取客户端申请的范围，没申请就算全部；再只留账号那种身份的。很多客户端会直接申请服务端支持的全部范围，所以第二步不能省。客户端只申请了另一种身份的范围时，确认页直接说明这个账号是什么身份，不发令牌。
 
-连接器地址推荐用 `/mcp`，在确认页上选身份。另有 `/mcp/candidate` 和 `/mcp/recruiter` 两个地址固定身份：确认页上不用选，令牌只有那种身份的范围，也只列出对应的工具。每个地址有自己的资源元数据（`/.well-known/oauth-protected-resource/mcp/candidate` 等），里面只声明那种身份的范围。
+连接器地址只有一个：`/mcp`。工具列表按令牌的范围过滤，求职者和招聘者各看到自己能用的工具。
 
-**（2）命令行和技能包：设备码。** agent 向服务端要一个设备码，并说明要哪些范围。服务端转去向 GitHub 申请，把 GitHub 的验证地址和用户码返回给 agent。人在 `github.com/login/device` 输入用户码。agent 轮询换令牌的端点，拿到令牌。这条路不经过 hire 的任何页面。
+**（2）命令行和技能包：设备码。** agent 向服务端要一个设备码，并说明要哪些范围，只能是一种身份的。账号已经是另一种身份时，换令牌这一步返回 `access_denied`。服务端转去向 GitHub 申请，把 GitHub 的验证地址和用户码返回给 agent。人在 `github.com/login/device` 输入用户码。agent 轮询换令牌的端点，拿到令牌。这条路不经过 hire 的任何页面。
 
 令牌是随机串，库里只存哈希。访问令牌有效 1 小时，刷新令牌有效 30 天。刷新令牌只能用一次，每次刷新都换一对新的。授权码也只能用一次，5 分钟内有效。
 
@@ -90,7 +90,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `contact_email` | 字符串 | 邀约被接受后，求职者能看到 |
 | `active_at` | 时间 | 招聘者最近活跃时间，见“活跃度” |
 
-一家公司只属于创建它的那个账号。通过接口，一个账号只能创建和修改一家公司。演示数据导入时会在一个账号下挂多家公司，这时发布岗位要用 `company_id` 指定是哪一家。
+公司不能重名，不区分大小写。因为没有认证，重名只会让人分不清谁是谁。一家公司只属于创建它的那个账号。通过接口，一个账号只能创建和修改一家公司。演示数据导入时会在一个账号下挂多家公司，这时发布岗位要用 `company_id` 指定是哪一家。
 
 ### 岗位 `jobs`
 
@@ -101,15 +101,13 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `title` | 字符串 | 60 字以内 |
 | `recruit_type` | 枚举 | 见“招聘类型” |
 | `category` | 枚举 | 见“职类” |
-| `cities` | 字符串数组 | 至少一个 |
+| `cities` | 字符串数组 | 至少一个。“北京市”存成“北京”，搜索时也一样处理 |
 | `remote` | 布尔 | 是否可远程 |
-| `teams` | 字符串数组 | 部门或事业群，自由文本，可空 |
 | `experience` | 枚举 | 见“经验” |
 | `degree` | 枚举 | 见“学历”，表示最低要求 |
 | `grad_years` | 整数数组 | 面向届别，如 `[2027, 2028]`，可空 |
 | `salary_min`、`salary_max` | 整数 | 面议时可空 |
 | `salary_unit` | 枚举 | `per_day`（元/天）或 `k_per_month`（千元/月） |
-| `salary_months` | 整数 | 年薪月数，如 14，可空 |
 | `salary_negotiable` | 布尔 | |
 | `days_per_week` | 整数 | 仅实习，1 到 7 |
 | `min_months` | 整数 | 仅实习，最短实习月数 |
@@ -118,11 +116,9 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `requirements` | 文本 | 任职要求 |
 | `bonus` | 文本 | 加分项，可空 |
 | `skills` | 字符串数组 | 技能标签，最多 15 个 |
-| `headcount` | 整数 | 招聘人数，可空 |
-| `deadline` | 日期 | 可空 |
+| `headcount` | 整数 | 招聘人数，可空。录用人数到了这个数，岗位自动暂停 |
+| `deadline` | 日期 | 可空。不能填过去的日期；过了这一天，岗位不出现在搜索里，也不能投递和主动邀约 |
 | `status` | 枚举 | `open`、`paused`、`closed` |
-| `source_url` | 字符串 | 模拟数据的参考来源，可空 |
-| `custom_fields` | 键值对 | 最多 10 项 |
 | `questions` | 对象数组 | 筛选问题，最多 3 个，见“筛选问题” |
 | `detail_views` | 整数 | 详情被别人读取的次数，不去重，只在 `job_stats` 里返回 |
 
@@ -167,7 +163,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `invitation` | 对象 | 邀约内容，见下 |
 | `chosen_slot` | 时间 | 求职者接受时选的面试时间 |
 | `answers` | 对象数组 | 筛选问题的回答，连题目一起存，岗位之后改了问题也不受影响 |
-| `responded_at` | 时间 | 招聘者第一次处理这条投递的时间，用来算处理比例 |
+| `decided_at` | 时间 | 招聘者第一次做出决定（邀约或拒绝）的时间，用来算决定比例 |
 | `reject_reason` | 枚举 | 招聘者拒绝时选的原因，见“投递状态” |
 | `offer` | 对象 | 录用内容：`start_date`、`salary`、`salary_unit`、`reply_by`，都可空 |
 | `closed_by` | 枚举 | `candidate`、`recruiter`、`system`，结束时填 |
@@ -186,14 +182,14 @@ BOSS 直聘靠“刚刚活跃”“回复率”让求职者避开没人管的岗
 
 | 信号 | 在哪 | 怎么算 |
 |---|---|---|
-| 招聘者最近活跃时间 | `jobs_search` 的 `recruiter_active_at`，`job_get` 的 `recruiter.active_at` | 账号以招聘者身份调过接口的时间 |
-| 处理比例 | `job_get` 的 `recruiter.response_rate` | 这家公司近 90 天收到的投递里，招聘者查看、邀约或拒绝过的比例。没有投递时为 `null` |
-| 平均处理时长 | `job_get` 的 `recruiter.avg_response_hours` | 从投递到第一次处理的平均小时数 |
-| 求职者最近活跃时间 | `candidates_search` 和 `candidate_get` 的 `active_at` | 账号以求职者身份调过接口的时间 |
+| 招聘者最近活跃时间 | `jobs_search` 的 `recruiter_active_at`，`job_get` 的 `recruiter.active_at` | 账号最近一次主动操作的时间 |
+| 决定比例 | `job_get` 的 `recruiter.decision_rate` | 这家公司近 90 天收到的投递里，招聘者邀约或拒绝过的比例。只是查看不算。没有投递时为 `null` |
+| 平均决定用时 | `job_get` 的 `recruiter.avg_decision_hours` | 从投递到做出决定的平均小时数 |
+| 求职者最近活跃时间 | `candidates_search` 和 `candidate_get` 的 `active_at` | 账号最近一次主动操作的时间 |
 
 两个搜索都有 `active_within_days` 过滤项。
 
-活跃时间只认身份明确的调用。单一身份的工具算那个身份；`events_poll` 和 `quota_get` 算令牌带的全部身份；两种身份都能调的工具（如 `jobs_search`）不算。一小时内只写一次库。
+这些信号要防 agent 刷。agent 读一遍投递、挂着轮询都不花力气，所以“已查看”不算做出决定，`events_poll` 和 `quota_get` 不算活跃。其余调用都算，一小时内只写一次库。
 
 ## 筛选问题
 
@@ -266,7 +262,16 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 其他变化一律返回 `invalid_transition` 错误，并在错误里带上当前状态。
 
-同一对岗位和求职者，上一条投递进入终态 7 天后才能再投。
+同一对岗位和求职者，上一条投递被拒绝或撤回后 7 天内，双方都不能再发起：求职者不能再投，招聘者不能再主动邀约。因岗位关闭或过期而结束的不受这个限制。
+
+对一条还没回应的邀约再发一次邀约，就是改时间，状态仍是“已邀约”。面试时间过了的邀约不能再接受。
+
+每天有一个定时任务清理没人管的投递，改成“已关闭”，给双方各发一条 `application.expired` 事件：
+
+- 投递 30 天没等到决定。
+- 邀约给出的时间全过了，还没回应。
+- 约好的面试过了 30 天没有结果。
+- 录用发出 30 天没回应。
 
 ## 事件
 
@@ -277,15 +282,17 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | `application.created` | 招聘者 | 收到新投递 |
 | `application.viewed` | 求职者 | 投递被查看 |
 | `invitation.created` | 求职者 | 收到邀约 |
+| `invitation.updated` | 求职者 | 邀约改了时间 |
 | `invitation.accepted` | 招聘者 | 邀约被接受 |
 | `offer.created` | 求职者 | 收到录用 |
 | `offer.accepted` | 招聘者 | 录用被接受 |
 | `application.rejected` | 对方 | 任一方拒绝。招聘者拒绝时带 `reason` |
 | `application.withdrawn` | 招聘者 | 求职者撤回 |
 | `application.closed` | 求职者 | 岗位关闭 |
+| `application.expired` | 双方 | 投递过期 |
 | `job.matched` | 求职者 | 订阅命中了新岗位。没有投递编号，带 `job_id` 和 `subscription_id` |
 
-事件带自增序号。轮询时传 `after=<上次拿到的最大序号>`，服务端返回之后的事件，一次最多 100 条。事件保留 30 天。
+事件带自增序号。服务端给每个账号记着拉到了哪个序号，直接调用就只返回之后的新事件，一次最多 100 条。agent 换了会话不用记序号，也不会把旧事件再报一遍。想重看旧事件时传 `after`，传 0 从头看。事件保留 30 天。
 
 事件里只放投递编号、岗位标题、对方名称和备注。详情让 agent 再调投递详情接口。
 
@@ -295,9 +302,9 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 | 对象 | 上限 | 说明 |
 |---|---|---|
-| 求职者投递 | 每天 20 次 | 撤回不返还 |
+| 求职者投递 | 每天 20 次 | 撤回不返还。上限写在插入语句的条件里，并发请求也挤不过去 |
 | 招聘者主动邀约 | 每个岗位每天 20 次 | 回应投递的邀约不计入 |
-| 搜索 | 每分钟 30 次 | 两种身份相同 |
+| 搜索 | 每分钟 30 次 | 求职者和招聘者相同 |
 | 事件轮询 | 每分钟 6 次 | |
 
 “每天”按北京时间 0 点重置。超出时返回 HTTP 429，错误码 `quota_exceeded`，并带 `reset_at`。四个数字都是配置项。
@@ -364,7 +371,7 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `profile_get` | `GET /me/profile` | 是 | `candidate:read` |
 | `profile_update` | `PATCH /me/profile` | 否 | `candidate:write` |
 | `resume_upload` | `PUT /me/resume/pdf` | 否 | `candidate:write` |
-| `resume_set_visibility` | `PUT /me/resume/visibility` | 否 | `candidate:write` |
+| `profile_delete` | `POST /me/profile/delete` | 否 | `candidate:write` |
 | `application_create` | `POST /applications` | 否 | `candidate:apply` |
 | `applications_list` | `GET /applications` | 是 | `candidate:read` |
 | `application_withdraw` | `POST /applications/{id}/withdraw` | 否 | `candidate:apply` |
@@ -391,7 +398,7 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `offer_create` | `POST /applications/{id}/offer` | 否 | `recruiter:invite` |
 | `application_reject` | `POST /applications/{id}/reject` | 否 | `recruiter:invite` |
 
-### 两种身份共用
+### 求职者和招聘者都有
 
 | MCP 工具 | REST | 只读 | 范围 |
 |---|---|---|---|
@@ -401,7 +408,7 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `events_poll` | `GET /events` | 是 | 任意 |
 | `quota_get` | `GET /quota` | 是 | 任意 |
 
-共 29 个工具，其中 12 个只读。求职者令牌和招聘者令牌各能看到 17 个。
+共 29 个工具。求职者能看到 17 个，其中 7 个只读；招聘者能看到 17 个，其中 9 个只读。
 
 `application_get` 没有标为只读：招聘者第一次调用时，投递会从“已投递”变成“已查看”，并给求职者发一条事件。它是幂等的，重复调用不再产生变化。
 
@@ -412,29 +419,33 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 
 几个容易写错的细节：
 
-- `profile_update` 是部分更新，只改传入的字段。数组字段整体替换。
+- `profile_update` 是部分更新，只改传入的字段。数组字段整体替换。专业、城市、简介、手机、邮箱传 `null` 表示清空。简历是否公开也在这里改（`resume_public`）。
+- `profile_delete` 删除简历、手机、邮箱、PDF 和订阅，并撤回还没结束的投递。投递记录保留，但里面的定制简历和筛选问题回答会清掉。账号和身份保留，可以重新填资料。
+- 所有链接字段只接受 http 和 https 地址。
 - `resume_upload` 在 MCP 里接收 base64 内容。在 REST 里除了同样的 JSON，也接收 `multipart/form-data`（字段名 `file`）和直接发送的 PDF 内容。
 - `application_create` 的入参是 `job_id`、可选的 `custom_resume`、可选的 `note`，岗位有筛选问题时还要 `answers`。姓名、学校、学历、毕业年份四项填齐后才能投递。
-- `invitation_create` 有两种用法：传 `application_id` 是回应投递，传 `job_id` 加 `candidate_id` 是主动邀约。后一种会新建一条投递。
+- `invitation_create` 有两种用法：传 `application_id` 是回应投递或改时间，传 `job_id` 加 `candidate_id` 是主动邀约。后一种会新建一条投递。线下面试必须写地址。
 - `invitation_respond` 的入参是 `accept`（布尔）、接受时必填的 `slot`、可选的 `note`。`slot` 必须是邀约里给出的时间之一。
 - `job_close` 会把这个岗位下还没约上面试的投递改成“已关闭”。
 - `application_reject` 的 `reason` 必填。
-- `job_stats` 返回漏斗：`applied`（求职者投递数）、`responded`（处理过的）、`invited`、`accepted`、`offered`、`hired`（走到过这一步的投递数），另有各状态当前的条数和拒绝原因分布。
+- `job_stats` 返回漏斗：`applied`（求职者投递数）、`viewed`（查看过的）、`decided`（邀约或拒绝过的）、`invited`、`accepted`、`offered`、`hired`（走到过这一步的投递数），另有各状态当前的条数和拒绝原因分布。
 - `job_get` 返回的对象里带公司的基本资料，agent 不需要再查一次。
 - `jobs_search` 传 `mine=true` 时，列出调用者名下所有状态的岗位，需要 `recruiter:read`。
-- 同一个账号既是求职者又是岗位的招聘者时，`application_get` 按令牌的范围决定用哪个身份看。令牌两种范围都有时，用 `as` 参数指定。
+- 求职者调 `jobs_search` 和 `job_get` 时，结果里带 `my_application`：自己对这个岗位最近一条投递的编号和状态。招聘者调 `candidates_search` 和 `candidate_get` 时同理，带的是自己和这位求职者之间最近的一条。
 
 ### 搜索
 
-岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`、`active_within_days`、`mine`。只返回 `open` 状态的岗位，`mine=true` 时除外。
+岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`、`active_within_days`、`mine`。只返回 `open` 状态、没过截止日期的岗位，`mine=true` 时除外。
 
 求职者搜索的过滤项：`q`、`recruit_type`、`city`、`degree`、`grad_year`、`days_per_week_min`、`skills`、`active_within_days`。只返回公开了简历的求职者。
 
-两个搜索都用游标分页，每页默认 20 条、最多 50 条，按更新时间倒序。服务端不打分。结果里的列表项只含摘要字段，详情另取。
+两个搜索都用游标分页，每页默认 20 条、最多 50 条，岗位按发布时间倒序，求职者按注册时间倒序。修改岗位或资料不改变排位，翻页也不会因此漏掉或重复。服务端不打分。结果里的列表项只含摘要字段，详情另取。
 
 `skills` 传多个时，命中任意一个就算匹配。`q` 里用空格隔开的多个词要全部出现。`degree` 在岗位搜索里表示“我的学历”，返回最低要求不高于它的岗位；在求职者搜索里表示“最低学历”。
 
 `salary_min` 必须和 `salary_unit` 一起传，只匹配同一单位的岗位。两种单位之间不换算。
+
+`days_per_week_max` 遇到没填每周天数的岗位（非实习）按 5 天算。`min_months_max` 不过滤没填最短月数的岗位。
 
 ### 错误格式
 
@@ -498,7 +509,7 @@ GitHub 登录要两个密钥，用 `wrangler secret put` 设置：`GITHUB_CLIENT
 
 演示期间所有数据都是模拟的。
 
-- 岗位：参考腾讯校招、DeepSeek 招聘页的公开岗位改写，共 31 条，`source_url` 指向参考的原页面。职责和要求是重新写的，薪资是编的。
+- 岗位：参考腾讯校招、DeepSeek 招聘页的公开岗位改写，共 31 条，职责和要求是重新写的，薪资是编的。
 - 公司：名称后加“（演示）”，如“腾讯（演示）”。服务部署在公网，任何登录的人都能看到这些岗位，名称上必须能看出它不是真的。
 - 求职者：8 份虚构简历，不用真人信息。这些账号没有人能登录，只用来演示招聘者搜索。
 - 招聘者：两家演示公司都挂在仓库所有者的 GitHub 账号下。他登录后就是这些岗位的招聘者，所以岗位都可以投，也都会有人回应。
@@ -513,7 +524,7 @@ node scripts/seed.mjs --url <服务地址> --remote
 
 ## 技能包
 
-技能包在 `skills/hire/SKILL.md`，两种身份共用。内容：
+技能包在 `skills/hire/SKILL.md`，求职者和招聘者共用。内容：
 
 - 怎么连接：MCP 地址，或设备码登录的步骤。
 - 求职者一侧：怎么把一份 PDF 或 Markdown 简历整理成 `profile_update` 的入参；搜索时先用硬条件过滤，再自己读详情判断；投递前把 `custom_resume` 和备注给人看一遍。
@@ -523,7 +534,7 @@ node scripts/seed.mjs --url <服务地址> --remote
 
 ## 验收
 
-开两个 Claude Code 会话，都装上技能包，完成下面的流程并录屏：
+开两个会话，用两个 GitHub 账号登录（一个账号只能有一种身份），都装上技能包，完成下面的流程并录屏：
 
 1. 会话 A 以招聘者身份登录，创建公司，发布一个日常实习岗位。
 2. 会话 B 以求职者身份登录，上传简历，按“北京、日常实习、每周 4 天”搜索，找到这个岗位并投递。
@@ -542,3 +553,4 @@ node scripts/seed.mjs --url <服务地址> --remote
 - 自由对话：硬条件通过后，双方 agent 限定轮数的对话。
 - 回调通知。
 - 一家公司多个招聘者。
+- 招聘者删除公司。现在只能关闭岗位。

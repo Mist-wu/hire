@@ -25,10 +25,8 @@ describe("MCP", () => {
     expect(candidateTools).toContain("application_create");
     expect(candidateTools).not.toContain("job_create");
     expect(candidateTools).toHaveLength(17);
-    expect(await names(await login(name, RECRUITER))).toHaveLength(17);
-    const all = await login(name);
-    expect(await names(all)).toHaveLength(29);
-    expect(await names(all, "/mcp/recruiter")).toHaveLength(17);
+    expect(await names(await login(unique("mcp"), RECRUITER))).toHaveLength(17);
+    const all = seeker;
     expect(await names(await login(name, "candidate:read"))).toEqual([
       "profile_get", "jobs_search", "job_get", "subscriptions_list", "applications_list", "application_get", "events_poll", "quota_get",
     ]);
@@ -37,7 +35,7 @@ describe("MCP", () => {
     const search = tools.find((t: any) => t.name === "jobs_search");
     expect(search.annotations.readOnlyHint).toBe(true);
     expect(search.inputSchema.properties.recruit_type.enum).toContain("intern_daily");
-    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(12);
+    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(7);
     expect(tools.find((t: any) => t.name === "application_get").annotations.readOnlyHint).toBe(false);
   });
 
@@ -53,8 +51,8 @@ describe("MCP", () => {
 
     const forbidden = await mcp(seeker, "tools/call", { name: "job_create", arguments: internJob });
     expect(JSON.parse(forbidden.data.result.content[0].text).error.code).toBe("forbidden_scope");
-    const wrongRole = await mcp(seeker, "tools/call", { name: "job_create", arguments: internJob }, "/mcp/candidate");
-    expect(wrongRole.data.error.code).toBe(-32602);
+    expect((await mcp(seeker, "tools/call", { name: "nope", arguments: {} })).data.error.code).toBe(-32602);
+    expect((await SELF.fetch(`${BASE}/mcp/candidate`, { method: "POST", body: "{}" })).status).toBe(404);
     expect((await mcp(seeker, "nope/method")).data.error.code).toBe(-32601);
 
     const note = await SELF.fetch(`${BASE}/mcp`, {
