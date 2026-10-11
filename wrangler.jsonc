@@ -8,7 +8,7 @@
     {
       "binding": "DB",
       "database_name": "hire",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "d2e4eaf9-efbb-41da-b2f4-c97d5f87da6b",
       "migrations_dir": "migrations"
     }
   ],

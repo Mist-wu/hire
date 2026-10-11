@@ -16,7 +16,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 不做的事：
 
-- 网页和 App。
+- 网页和 App。唯一的例外是登录时的一个授权确认页，原因见“登录”一节。
 - 服务端跑模型。解析简历、给岗位打分都交给用户的 agent。
 - 自由对话。双方只通过固定的状态和一段备注交流。
 - 公司资质审核。所有公司都标为“未认证”。
@@ -33,7 +33,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 同一个账号可以同时有两种身份。演示时一个 GitHub 账号就能扮两边。
 
-令牌按身份签发，一个令牌只属于一种身份。令牌还带权限范围，服务端按范围放行或拒绝：
+令牌带权限范围，服务端按范围放行或拒绝。授权时选一种身份，令牌就只有那种身份的三个范围。客户端也可以明确申请其中几个范围，比如只读。
 
 | 范围 | 覆盖的动作 |
 |---|---|
@@ -50,15 +50,24 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 ### 登录
 
-有两条路，签出的令牌格式相同。
+有两条路，签出的令牌格式相同。两条路都靠 GitHub 确认身份，hire 自己不存密码。
 
-**（1）MCP 连接器：标准 OAuth。** 服务端实现授权服务器的元数据、动态客户端注册、授权和换令牌四个端点。授权端点不出页面，直接跳转到 GitHub 授权，回调后再跳回客户端。
+**（1）MCP 连接器：标准 OAuth。** 服务端实现授权服务器的元数据、动态客户端注册、授权和换令牌四组端点，强制使用 PKCE。流程是：
 
-**（2）命令行和技能包：设备码。** agent 向服务端要一个设备码，服务端转去向 GitHub 申请，把 GitHub 的验证地址和用户码返回给 agent。人在 `github.com/login/device` 输入用户码。agent 轮询服务端，拿到令牌。
+1. 客户端打开授权地址，服务端直接跳转到 GitHub。
+2. GitHub 登录后跳回服务端，服务端显示一个授权确认页。
+3. 人在确认页上选身份（求职者或招聘者），或点拒绝。
+4. 服务端带着授权码跳回客户端，客户端换令牌。
 
-两条路都不需要 hire 自己的页面。
+确认页是 hire 唯一的页面，不能省。客户端可以自行注册，如果没有确认这一步，任何人都能注册一个客户端，再诱导已登录过的用户点一个链接，悄悄拿到他的令牌。确认页上写明是哪个客户端、授权后跳到哪个地址。
 
-令牌是随机串，库里只存哈希。访问令牌有效 1 小时，刷新令牌有效 30 天。
+确认页只能在发起授权的那个浏览器里完成。服务端在第 1 步种一个 cookie，第 2、3 步都要核对它。
+
+连接器地址有三个：`/mcp` 在确认页上选身份；`/mcp/candidate` 和 `/mcp/recruiter` 固定身份，只列出对应的工具。想在同一个客户端里同时用两种身份，就把后两个各加一次。
+
+**（2）命令行和技能包：设备码。** agent 向服务端要一个设备码，并说明要哪些范围。服务端转去向 GitHub 申请，把 GitHub 的验证地址和用户码返回给 agent。人在 `github.com/login/device` 输入用户码。agent 轮询换令牌的端点，拿到令牌。这条路不经过 hire 的任何页面。
+
+令牌是随机串，库里只存哈希。访问令牌有效 1 小时，刷新令牌有效 30 天。刷新令牌只能用一次，每次刷新都换一对新的。授权码也只能用一次，5 分钟内有效。
 
 ## 数据模型
 
@@ -78,7 +87,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `verified` | 布尔 | 固定为 `false` |
 | `contact_email` | 字符串 | 邀约被接受后，求职者能看到 |
 
-一个招聘者属于一家公司。演示阶段，一家公司只有创建它的那一个招聘者。
+一家公司只属于创建它的那个账号。通过接口，一个账号只能创建和修改一家公司。演示数据导入时会在一个账号下挂多家公司，这时发布岗位要用 `company_id` 指定是哪一家。
 
 ### 岗位 `jobs`
 
@@ -286,7 +295,9 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 ## 接口
 
-REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路径都以 `/v1` 开头。
+REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路径都以 `/v1` 开头。两者由同一份操作注册表生成，OpenAPI 文档（`/v1/openapi.json`）也是。
+
+范围一栏写了两个的，有其中一个就能调用。
 
 ### 求职者
 
@@ -296,8 +307,6 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `profile_update` | `PATCH /me/profile` | 否 | `candidate:write` |
 | `resume_upload` | `PUT /me/resume/pdf` | 否 | `candidate:write` |
 | `resume_set_visibility` | `PUT /me/resume/visibility` | 否 | `candidate:write` |
-| `jobs_search` | `GET /jobs` | 是 | `candidate:read` |
-| `job_get` | `GET /jobs/{id}` | 是 | `candidate:read` |
 | `application_create` | `POST /applications` | 否 | `candidate:apply` |
 | `applications_list` | `GET /applications` | 是 | `candidate:read` |
 | `application_withdraw` | `POST /applications/{id}/withdraw` | 否 | `candidate:apply` |
@@ -307,6 +316,7 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 
 | MCP 工具 | REST | 只读 | 范围 |
 |---|---|---|---|
+| `company_get` | `GET /company` | 是 | `recruiter:read` |
 | `company_upsert` | `PUT /company` | 否 | `recruiter:write` |
 | `job_create` | `POST /jobs` | 否 | `recruiter:write` |
 | `job_update` | `PATCH /jobs/{id}` | 否 | `recruiter:write` |
@@ -321,31 +331,42 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 
 | MCP 工具 | REST | 只读 | 范围 |
 |---|---|---|---|
-| `application_get` | `GET /applications/{id}` | 否 | 各自的 `read` |
+| `jobs_search` | `GET /jobs` | 是 | `candidate:read` 或 `recruiter:read` |
+| `job_get` | `GET /jobs/{id}` | 是 | `candidate:read` 或 `recruiter:read` |
+| `application_get` | `GET /applications/{id}` | 否 | `candidate:read` 或 `recruiter:read` |
 | `events_poll` | `GET /events` | 是 | 任意 |
 | `quota_get` | `GET /quota` | 是 | 任意 |
 
-共 22 个工具，其中 9 个只读。
+共 23 个工具，其中 10 个只读。求职者令牌能看到 13 个，招聘者令牌能看到 15 个。
 
 `application_get` 没有标为只读：招聘者第一次调用时，投递会从“已投递”变成“已查看”，并给求职者发一条事件。它是幂等的，重复调用不再产生变化。
+
+另有两个下载 PDF 的地址，只有 REST，没有对应的工具：
+
+- `GET /me/resume/pdf`：求职者下载自己上传的 PDF。
+- `GET /applications/{id}/resume.pdf`：招聘者下载求职者的 PDF，投递必须是“已接受”。
 
 几个容易写错的细节：
 
 - `profile_update` 是部分更新，只改传入的字段。数组字段整体替换。
-- `resume_upload` 在 MCP 里接收 base64 内容，在 REST 里接收 `multipart/form-data`。
-- `application_create` 的入参是 `job_id`、可选的 `custom_resume`、可选的 `note`。
+- `resume_upload` 在 MCP 里接收 base64 内容。在 REST 里除了同样的 JSON，也接收 `multipart/form-data`（字段名 `file`）和直接发送的 PDF 内容。
+- `application_create` 的入参是 `job_id`、可选的 `custom_resume`、可选的 `note`。姓名、学校、学历、毕业年份四项填齐后才能投递。
 - `invitation_create` 有两种用法：传 `application_id` 是回应投递，传 `job_id` 加 `candidate_id` 是主动邀约。后一种会新建一条投递。
 - `invitation_respond` 的入参是 `accept`（布尔）、接受时必填的 `slot`、可选的 `note`。`slot` 必须是邀约里给出的时间之一。
 - `job_close` 会把这个岗位下所有未结束的投递改成“已关闭”。
-- `job_get` 和 `candidate_get` 返回的对象里带公司或求职者的基本资料，agent 不需要再查一次。
+- `job_get` 返回的对象里带公司的基本资料，agent 不需要再查一次。
+- `jobs_search` 传 `mine=true` 时，列出调用者名下所有状态的岗位，需要 `recruiter:read`。
+- 同一个账号既是求职者又是岗位的招聘者时，`application_get` 按令牌的范围决定用哪个身份看。令牌两种范围都有时，用 `as` 参数指定。
 
 ### 搜索
 
-岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`。只返回 `open` 状态的岗位。
+岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`、`mine`。只返回 `open` 状态的岗位，`mine=true` 时除外。
 
 求职者搜索的过滤项：`q`、`recruit_type`、`city`、`degree`、`grad_year`、`days_per_week_min`、`skills`。只返回公开了简历的求职者。
 
-两个搜索都用游标分页，每页最多 50 条，按更新时间倒序。服务端不打分。结果里的列表项只含摘要字段，详情另取。
+两个搜索都用游标分页，每页默认 20 条、最多 50 条，按更新时间倒序。服务端不打分。结果里的列表项只含摘要字段，详情另取。
+
+`skills` 传多个时，命中任意一个就算匹配。`q` 里用空格隔开的多个词要全部出现。`degree` 在岗位搜索里表示“我的学历”，返回最低要求不高于它的岗位；在求职者搜索里表示“最低学历”。
 
 `salary_min` 必须和 `salary_unit` 一起传，只匹配同一单位的岗位。两种单位之间不换算。
 
@@ -369,39 +390,64 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 
 ## 技术选型
 
+全部跑在 Cloudflare 上，没有自己的服务器。
+
 | 部分 | 选择 | 原因 |
 |---|---|---|
-| 语言和框架 | Rust、axum、tokio | |
-| 数据库 | SQLite，开 WAL | 单机单文件，备份就是复制文件 |
-| 数据库访问 | sqlx | 编译期检查 SQL |
+| 运行环境 | Cloudflare Workers | 不用管进程和证书，演示规模在免费额度内 |
+| 语言和框架 | TypeScript、Hono | Workers 上支持最好的组合 |
+| 数据库 | D1 | 就是 SQLite，SQL 和本地开发一致 |
 | 全文搜索 | SQLite FTS5，trigram 分词 | 默认分词器不切分中文，trigram 能做子串匹配 |
-| MCP | rmcp，Streamable HTTP，挂在 `/mcp` | 官方 Rust SDK |
-| 接口文档 | utoipa 生成 OpenAPI | 从代码生成，不会和实现脱节 |
-| 文件 | PDF 存本地目录 | 数据库里只存路径和哈希 |
-| 日志 | tracing，每个请求带请求编号 | |
+| 文件 | R2 存 PDF | 数据库里只存路径、文件名和大小 |
+| 入参校验 | zod | 同一份定义用来校验、生成 MCP 工具的入参说明和 OpenAPI |
+| MCP | 自己实现 Streamable HTTP 的无状态子集 | 只需要握手、列工具、调工具三件事，约 150 行，不依赖 Durable Objects |
+| OAuth | 自己实现 | 授权码、刷新、设备码共用一张令牌表，约 400 行 |
+| 测试 | vitest 加 Cloudflare 的测试插件 | 测试跑在真实的 Workers 运行时里，D1 用本地实例 |
 
-trigram 分词至少要 3 个字符才能命中。搜“后端”这类两个字的词时，退回到对标题和技能标签做 `LIKE` 匹配。
+trigram 分词至少要 3 个字符才能命中。搜“后端”这类两个字的词时，退回到对 `search_text` 列做 `LIKE` 匹配。`search_text` 在写入岗位或简历时由服务端拼好。
 
-仓库只放代码。数据库文件、PDF 目录、GitHub 应用的密钥都在服务器上，不进仓库。
+状态变化用乐观锁保证一致。每条投递有一个随机的 `rev` 字段。改状态、写日志、发事件三条语句放在同一个 batch 里，都以“`rev` 还是我读到的那个值”为条件。两个请求同时改同一条投递时，后到的那个整体不生效，并收到 `invalid_transition`。
+
+MCP 测试里用官方 SDK 的客户端连了一遍，确认握手和工具调用能通。
+
+仓库只放代码。数据库、PDF、GitHub 应用的密钥都在 Cloudflare 上，不进仓库。
 
 ### 部署
 
-一个二进制文件，一个数据目录，前面放 Caddy 或 nginx 做 HTTPS。配置走环境变量：监听地址、数据目录、对外的基础地址、GitHub 应用的编号和密钥、四个限额。
+```bash
+npx wrangler d1 migrations apply hire --remote
+```
+
+```bash
+npx wrangler deploy
+```
+
+配置在 `wrangler.jsonc`：D1 和 R2 的绑定、四个限额、一个每天执行一次的定时任务。定时任务清理 30 天前的事件、过期的授权记录和令牌。
+
+GitHub 登录要两个密钥，用 `wrangler secret put` 设置：`GITHUB_CLIENT_ID` 和 `GITHUB_CLIENT_SECRET`。对应的 GitHub OAuth 应用要把回调地址设成 `<服务地址>/oauth/github/callback`，并勾选 Enable Device Flow。没设密钥时，登录相关的端点返回“未配置”的错误，其余接口不受影响。
+
+本地开发用 `npx wrangler dev`。在 `.dev.vars` 里写 `DEV_LOGIN=1` 会多出一个 `POST /oauth/dev/token` 端点，传一个用户名就能拿到令牌，不经过 GitHub。线上不设这个变量，端点不存在。
 
 ## 演示数据
 
 演示期间所有数据都是模拟的。
 
-- 岗位：参考腾讯校招、DeepSeek 招聘页的公开岗位，改写成约 30 条，`source_url` 指向参考的原页面。
-- 公司：名称后加“（演示）”，如“腾讯（演示）”。服务一旦部署到公网，任何人都能看到这些岗位，名称上必须能看出它不是真的。
-- 求职者：5 到 10 份虚构简历，不用真人信息。
-- 招聘者：由你自己扮演，所以这些岗位都可以投，也都会有人回应。
+- 岗位：参考腾讯校招、DeepSeek 招聘页的公开岗位改写，共 31 条，`source_url` 指向参考的原页面。职责和要求是重新写的，薪资是编的。
+- 公司：名称后加“（演示）”，如“腾讯（演示）”。服务部署在公网，任何登录的人都能看到这些岗位，名称上必须能看出它不是真的。
+- 求职者：8 份虚构简历，不用真人信息。这些账号没有人能登录，只用来演示招聘者搜索。
+- 招聘者：两家演示公司都挂在仓库所有者的 GitHub 账号下。他登录后就是这些岗位的招聘者，所以岗位都可以投，也都会有人回应。
 
-数据由一个导入命令写进服务器的数据库。种子文件不进仓库。
+数据由 `scripts/seed.mjs` 导入，可以重复执行：
+
+```bash
+node scripts/seed.mjs --url <服务地址> --remote
+```
+
+脚本用 SQL 写入账号、公司和几个 1 小时有效的临时令牌，然后通过 REST 接口创建岗位和简历，最后删掉临时令牌。岗位和简历走接口，是为了让搜索用的派生字段由服务端自己生成。种子文件 `seed/demo.json` 不进仓库。
 
 ## 技能包
 
-仓库里放一个技能包，两种身份共用。内容：
+技能包在 `skills/hire/SKILL.md`，两种身份共用。内容：
 
 - 怎么连接：MCP 地址，或设备码登录的步骤。
 - 求职者一侧：怎么把一份 PDF 或 Markdown 简历整理成 `profile_update` 的入参；搜索时先用硬条件过滤，再自己读详情判断；投递前把 `custom_resume` 和备注给人看一遍。

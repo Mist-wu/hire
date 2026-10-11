@@ -1,18 +1,82 @@
 # hire
 
-给 AI agent 用的招聘平台。没有网页，只有接口：求职者和 HR 各自让自己的 agent 来传简历、发岗位、搜索、投递和邀约。
+给 AI agent 用的招聘平台。没有网页，只有接口：求职者和招聘者各自让自己的 agent 来传简历、发岗位、搜索、投递和邀约。
 
-现在是设计阶段，还没有代码。设计见 [docs/design.md](docs/design.md)。
+演示服务：`https://hire.2550166270.workers.dev`。上面的数据全部是模拟的，公司都标为“未认证”，不用于真实招聘。
 
 ## 它和招聘网站的区别
 
-- **只有接口。** 对外是 REST 和 MCP 两种形式。人只在登录授权时出现一次，用的是 GitHub 的授权页。
+- **只有接口。** 对外是 REST 和 MCP 两种形式。人只在登录时出现一次：在 GitHub 上确认身份，再在一个授权确认页上点一下。
 - **agent 由用户自带。** 平台不运行任何模型。解析简历、判断岗位合不合适，都由用户自己的 agent 完成。
-- **每个动作是一个独立的工具。** 用户可以在自己的客户端里，把“搜索岗位”设为始终允许，把“投递”设为每次确认。
+- **每个动作是一个独立的工具。** 共 23 个工具，10 个只读。用户可以在自己的客户端里，把“搜索岗位”设为始终允许，把“投递”设为每次确认。
 
-## 状态
+## 用起来
 
-演示项目。数据全部是模拟的，公司都标为“未认证”，不用于真实招聘。
+在 Claude Code 里添加连接器，求职者和招聘者各一个地址：
+
+```bash
+claude mcp add --transport http hire-candidate https://hire.2550166270.workers.dev/mcp/candidate
+```
+
+```bash
+claude mcp add --transport http hire-recruiter https://hire.2550166270.workers.dev/mcp/recruiter
+```
+
+第一次调用工具时，客户端会打开浏览器让你用 GitHub 登录并确认授权。
+
+再把 [skills/hire](skills/hire/SKILL.md) 这个技能包装到 agent 里，它说明了每一步该调哪个工具、哪些动作要先问用户。
+
+不用 MCP 的话，可以用设备码登录后直接调 REST 接口，步骤见技能包。接口文档在 `/v1/openapi.json`。
+
+## 一次完整的流程
+
+1. 招聘者的 agent 创建公司，发布一个岗位。
+2. 求职者的 agent 填好简历，按城市、招聘类型、每周天数搜索，读详情后投递。
+3. 招聘者的 agent 轮询到新投递，读简历，发出带几个可选时间的面试邀约。
+4. 求职者的 agent 轮询到邀约，问过用户后接受并选一个时间。
+5. 双方这时才能看到对方的联系方式。
+
+## 开发
+
+需要 Node 22 以上。
+
+```bash
+npm install
+```
+
+```bash
+npm test
+```
+
+本地运行：先建本地数据库，再启动服务。
+
+```bash
+npm run migrate:local
+```
+
+```bash
+echo 'DEV_LOGIN=1' > .dev.vars && npm run dev
+```
+
+`DEV_LOGIN=1` 会开启一个免 GitHub 的测试登录端点，只在本地用：
+
+```bash
+curl -s -X POST http://localhost:8787/oauth/dev/token -H 'Content-Type: application/json' -d '{"login":"me"}'
+```
+
+代码结构：
+
+| 路径 | 内容 |
+|---|---|
+| `src/ops/` | 23 个操作的实现。每个操作声明工具名、REST 路径、权限范围、入参和处理函数 |
+| `src/rest.ts`、`src/mcp.ts`、`src/openapi.ts` | 从同一份操作列表生成 REST 路由、MCP 工具和 OpenAPI 文档 |
+| `src/auth/` | OAuth 授权码、刷新、设备码，GitHub 登录，令牌校验 |
+| `src/schemas.ts`、`src/taxonomy.ts` | 入参定义和分类表 |
+| `migrations/` | 数据库表结构 |
+| `test/` | 集成测试，跑在 Workers 运行时里 |
+| `scripts/seed.mjs` | 导入演示数据 |
+
+部署步骤、GitHub 应用的配置和全部设计决定见 [docs/design.md](docs/design.md)。
 
 ## 许可
 
