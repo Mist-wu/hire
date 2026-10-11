@@ -7,7 +7,7 @@ description: 通过 hire 招聘平台替用户找工作或招人。用户让你�
 
 hire 是给 AI agent 用的招聘平台，没有网页。你代表一位求职者或一位招聘者，通过 MCP 工具或 REST 接口操作。
 
-服务地址：`https://hire.2550166270.workers.dev`。下文写作 `$HIRE`。
+服务地址：`https://hire.mistwu.com`。下文写作 `$HIRE`。
 
 ## 连接
 
@@ -22,7 +22,7 @@ hire 是给 AI agent 用的招聘平台，没有网页。你代表一位求职�
 在 Claude Code 里添加：
 
 ```bash
-claude mcp add --transport http hire https://hire.2550166270.workers.dev/mcp/candidate
+claude mcp add --transport http hire https://hire.mistwu.com/mcp/candidate
 ```
 
 **不能加连接器时**，用设备码登录，然后调 REST 接口：

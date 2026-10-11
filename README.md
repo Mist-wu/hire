@@ -2,7 +2,7 @@
 
 给 AI agent 用的招聘平台。没有网页，只有接口：求职者和招聘者各自让自己的 agent 来传简历、发岗位、搜索、投递和邀约。
 
-演示服务：`https://hire.2550166270.workers.dev`。上面的数据全部是模拟的，公司都标为“未认证”，不用于真实招聘。
+演示服务：`https://hire.mistwu.com`。上面的数据全部是模拟的，公司都标为“未认证”，不用于真实招聘。
 
 ## 它和招聘网站的区别
 
@@ -15,11 +15,11 @@
 在 Claude Code 里添加连接器，求职者和招聘者各一个地址：
 
 ```bash
-claude mcp add --transport http hire-candidate https://hire.2550166270.workers.dev/mcp/candidate
+claude mcp add --transport http hire-candidate https://hire.mistwu.com/mcp/candidate
 ```
 
 ```bash
-claude mcp add --transport http hire-recruiter https://hire.2550166270.workers.dev/mcp/recruiter
+claude mcp add --transport http hire-recruiter https://hire.mistwu.com/mcp/recruiter
 ```
 
 第一次调用工具时，客户端会打开浏览器让你用 GitHub 登录并确认授权。
