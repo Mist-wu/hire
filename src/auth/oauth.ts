@@ -14,12 +14,12 @@ const REQUEST_TTL = 600;
 const CODE_TTL = 300;
 
 const SCOPE_LABELS: Record<Scope, string> = {
-  "candidate:read": "查看你的求职资料和投递，搜索岗位",
-  "candidate:write": "修改你的求职资料和简历",
-  "candidate:apply": "替你投递、撤回、回应邀约",
-  "recruiter:read": "搜索求职者，查看收到的投递",
-  "recruiter:write": "修改公司资料，发布和关闭岗位",
-  "recruiter:invite": "替你发出邀约、拒绝投递",
+  "candidate:read": "查看资料和投递、搜索岗位",
+  "candidate:write": "修改资料和简历",
+  "candidate:apply": "投递、撤回、回应邀约",
+  "recruiter:read": "搜索求职者、查看投递",
+  "recruiter:write": "修改公司、发布和关闭岗位",
+  "recruiter:invite": "发邀约、拒绝投递",
 };
 
 function oauthError(c: C, error: string, description: string, status: 400 | 401 | 503 = 400) {
@@ -100,46 +100,29 @@ function redirectWith(uri: string, params: Record<string, string | null | undefi
 }
 
 const PAGE_CSS = `
-:root{--bg:#f2f2f2;--card:#fff;--text:#1d1d1d;--muted:#595959;--line:#d9d9d9;--soft:#f7f7f7;--accent:#f6821f;--accent-hover:#e06d0a;--ok:#2f7d32}
-@media(prefers-color-scheme:dark){:root{--bg:#141414;--card:#1d1d1d;--text:#f2f2f2;--muted:#b6b6b6;--line:#3a3a3a;--soft:#242424;--accent:#f6821f;--accent-hover:#ff9a3d;--ok:#6fbf73}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-main{max-width:30rem;margin:0 auto;padding:3rem 1rem 2rem}
-.brand{display:flex;align-items:center;gap:.5rem;font-weight:700;font-size:1.25rem;letter-spacing:-.01em;margin:0 0 1.25rem .25rem}
-.dot{width:.7rem;height:.7rem;border-radius:50%;background:var(--accent)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:.5rem;overflow:hidden}
-.head{padding:1.5rem 1.5rem 1.25rem}
-h1{font-size:1.25rem;line-height:1.35;font-weight:600;margin:0 0 .5rem}
+:root{--bg:#fff;--text:#222;--muted:#6b6b6b;--line:#e5e5e5;--accent:#f6821f}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--text:#eee;--muted:#9a9a9a;--line:#333}}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+main{max-width:22rem;margin:0 auto;padding:4.5rem 1.25rem 2rem}
+.brand{font-weight:600;margin:0 0 2.5rem}
+h1{font-size:1.375rem;line-height:1.3;font-weight:600;margin:0 0 .375rem}
 p{margin:0}
-.sub{color:var(--muted)}
-.meta{display:grid;grid-template-columns:auto 1fr;gap:.35rem 1rem;padding:1rem 1.5rem;background:var(--soft);border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:.875rem}
-.meta dt{color:var(--muted)}
-.meta dd{margin:0;font-weight:500;word-break:break-all}
-.body{padding:1.25rem 1.5rem}
-.label{font-size:.8125rem;font-weight:600;color:var(--muted);margin:0 0 .75rem}
-.role{display:block;border:1px solid var(--line);border-radius:.375rem;padding:.875rem 1rem;margin:0 0 .75rem}
-label.role{cursor:pointer}
-label.role:has(input:checked){border-color:var(--accent)}
-.role-title{display:flex;align-items:center;gap:.6rem;font-weight:600}
-.role input{width:1rem;height:1rem;margin:0;accent-color:var(--accent)}
-ul{list-style:none;margin:.5rem 0 0;padding:0;font-size:.875rem;color:var(--muted)}
-li{position:relative;padding:.15rem 0 .15rem 1.5rem}
-li::before{content:"✓";position:absolute;left:.15rem;color:var(--ok);font-weight:700}
-.actions{display:flex;justify-content:flex-end;gap:.75rem;padding:1rem 1.5rem;border-top:1px solid var(--line)}
-button{font:inherit;font-weight:500;padding:.5rem 1.25rem;border-radius:.375rem;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
-button:hover{background:var(--soft)}
+.muted{color:var(--muted);font-size:.875rem;word-break:break-all}
+.roles{margin:1.75rem 0;border-top:1px solid var(--line)}
+.role{display:flex;gap:.75rem;padding:.875rem 0;border-bottom:1px solid var(--line)}
+.role input{flex:none;width:1rem;height:1rem;margin:.2rem 0 0;accent-color:var(--accent)}
+.role b{display:block;font-weight:500}
+.actions{display:flex;gap:.5rem}
+button{font:inherit;padding:.5rem 1.25rem;border-radius:4px;border:1px solid var(--line);background:none;color:var(--text);cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-button.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
 button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.foot{margin:1rem .25rem 0;font-size:.8125rem;color:var(--muted)}
-@media(max-width:26rem){main{padding-top:1.5rem}.actions{flex-direction:column-reverse}button{width:100%}}
 `;
 
 function page(title: string, inner: string, status: 200 | 400 = 200): Response {
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
 <title>${escapeHtml(title)}</title><style>${PAGE_CSS}</style></head>
-<body><main><div class="brand"><span class="dot"></span>hire</div>${inner}</main></body></html>`;
+<body><main><p class="brand">hire</p>${inner}</main></body></html>`;
   return new Response(html, {
     status,
     headers: {
@@ -153,11 +136,7 @@ function page(title: string, inner: string, status: 200 | 400 = 200): Response {
 }
 
 function failPage(message: string): Response {
-  return page(
-    "授权失败",
-    `<div class="card"><div class="head"><h1>授权失败</h1><p class="sub">${escapeHtml(message)}</p></div></div>`,
-    400,
-  );
+  return page("授权失败", `<h1>授权失败</h1><p class="muted">${escapeHtml(message)}</p>`, 400);
 }
 
 const ROLE_NAMES: Record<Role, string> = { candidate: "求职者", recruiter: "招聘者" };
@@ -357,30 +336,29 @@ oauth.get("/oauth/github/callback", async (c) => {
     host = u.host || u.protocol;
   } catch {}
 
-  const roleBlock = (role: Role) => {
-    const items = scopes
+  const roleRow = (role: Role) => {
+    const can = scopes
       .filter((s) => s.startsWith(`${role}:`))
-      .map((s) => `<li>${escapeHtml(SCOPE_LABELS[s])}</li>`)
-      .join("");
-    // 两种身份都可选时用复选框，让人决定给哪一种；只有一种时不需要选
-    return roles.length > 1
-      ? `<label class="role"><span class="role-title"><input type="checkbox" name="role" value="${role}" checked>${ROLE_NAMES[role]}</span><ul>${items}</ul></label>`
-      : `<div class="role"><input type="hidden" name="role" value="${role}"><span class="role-title">${ROLE_NAMES[role]}</span><ul>${items}</ul></div>`;
+      .map((s) => SCOPE_LABELS[s])
+      .join("；");
+    // 两种身份都可选时用复选框；只有一种时不需要选
+    const input =
+      roles.length > 1
+        ? `<input type="checkbox" name="role" value="${role}" checked>`
+        : `<input type="hidden" name="role" value="${role}">`;
+    return `<label class="role">${input}<span><b>${ROLE_NAMES[role]}</b><span class="muted">${escapeHtml(can)}</span></span></label>`;
   };
 
   return page(
     "授权访问 hire",
-    `<form method="post" action="/oauth/consent" class="card">
+    `<form method="post" action="/oauth/consent">
 <input type="hidden" name="request_id" value="${escapeHtml(request.id)}">
 <input type="hidden" name="csrf" value="${escapeHtml(request.csrf)}">
-<div class="head"><h1>允许 ${clientName} 访问你的 hire 账号？</h1>
-<p class="sub">它会代表你操作。你可以随时在客户端里退出登录来收回授权。</p></div>
-<dl class="meta"><dt>GitHub 账号</dt><dd>${escapeHtml(user.login)}</dd><dt>客户端</dt><dd>${clientName}</dd><dt>授权后跳转到</dt><dd>${escapeHtml(host)}</dd></dl>
-<div class="body"><p class="label">${roles.length > 1 ? "选择让它使用的身份" : "它可以做这些事"}</p>
-${roles.map(roleBlock).join("")}</div>
-<div class="actions"><button name="decision" value="deny">拒绝</button><button name="decision" value="approve" class="primary">授权</button></div>
-</form>
-<p class="foot">如果你没有在某个 AI 客户端里主动添加 hire，请点拒绝。</p>`,
+<h1>${clientName} 请求访问你的账号</h1>
+<p class="muted">${escapeHtml(user.login)} · 授权后跳转到 ${escapeHtml(host)}</p>
+<div class="roles">${roles.map(roleRow).join("")}</div>
+<div class="actions"><button name="decision" value="approve" class="primary">授权</button><button name="decision" value="deny">拒绝</button></div>
+</form>`,
   );
 });
 
