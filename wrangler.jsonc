@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hire",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hire",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "hire-files" }],
+  "triggers": { "crons": ["17 19 * * *"] },
+  "vars": {
+    "QUOTA_APPLY_PER_DAY": "20",
+    "QUOTA_INVITE_PER_JOB_PER_DAY": "20",
+    "QUOTA_SEARCH_PER_MIN": "30",
+    "QUOTA_POLL_PER_MIN": "6"
+  }
+}

@@ -1,0 +1,539 @@
+import { Hono, type Context } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { ROLE_SCOPES, SCOPES, type Env, type Role, type Scope } from "../env";
+import { HireError } from "../errors";
+import { escapeHtml, isoAfter, newId, nowIso, parseJson, randomHex, safeEqual, sha256Base64url, sha256Hex } from "../util";
+import { authorizeUrl, exchangeCode, getUser, githubConfig, pollDevice, startDevice } from "./github";
+import { issueTokens, parseScopes, upsertAccount } from "./tokens";
+
+type C = Context<{ Bindings: Env }>;
+
+const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
+const COOKIE = "hire_auth";
+const REQUEST_TTL = 600;
+const CODE_TTL = 300;
+
+const SCOPE_LABELS: Record<Scope, string> = {
+  "candidate:read": "查看你的求职资料和投递，搜索岗位",
+  "candidate:write": "修改你的求职资料和简历",
+  "candidate:apply": "替你投递、撤回、回应邀约",
+  "recruiter:read": "搜索求职者，查看收到的投递",
+  "recruiter:write": "修改公司资料，发布和关闭岗位",
+  "recruiter:invite": "替你发出邀约、拒绝投递",
+};
+
+function oauthError(c: C, error: string, description: string, status: 400 | 401 | 503 = 400) {
+  return c.json({ error, error_description: description }, status, { "Cache-Control": "no-store" });
+}
+
+function origin(c: C): string {
+  return new URL(c.req.url).origin;
+}
+
+async function body(c: C): Promise<Record<string, string>> {
+  const type = c.req.header("Content-Type") ?? "";
+  try {
+    if (type.includes("application/json")) {
+      const data = (await c.req.json()) as Record<string, unknown>;
+      return Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, Array.isArray(v) ? v.join(" ") : String(v ?? "")]),
+      );
+    }
+    const form = await c.req.parseBody();
+    return Object.fromEntries(Object.entries(form).map(([k, v]) => [k, String(v)]));
+  } catch {
+    return {};
+  }
+}
+
+function roleOfResource(resource: string | null | undefined): Role | null {
+  if (!resource) return null;
+  if (/\/mcp\/candidate\/?$/.test(resource)) return "candidate";
+  if (/\/mcp\/recruiter\/?$/.test(resource)) return "recruiter";
+  return null;
+}
+
+function isLoopback(url: URL): boolean {
+  return url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+}
+
+function validRedirectUri(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.hash) return false;
+  if (url.protocol === "https:") return true;
+  if (url.protocol === "http:") return isLoopback(url);
+  // 桌面客户端的自定义协议，如 cursor://。挡掉能执行脚本或读本地文件的协议
+  return !["javascript:", "data:", "vbscript:", "file:", "blob:", "about:"].includes(url.protocol);
+}
+
+/** 精确匹配。本机回环地址忽略端口，因为客户端每次监听的端口不同。 */
+function redirectMatches(registered: string[], given: string): boolean {
+  if (registered.includes(given)) return true;
+  try {
+    const g = new URL(given);
+    if (!isLoopback(g)) return false;
+    return registered.some((r) => {
+      const u = new URL(r);
+      return isLoopback(u) && u.hostname === g.hostname && u.pathname === g.pathname && u.search === g.search;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function redirectWith(uri: string, params: Record<string, string | null | undefined>): string {
+  const url = new URL(uri);
+  for (const [k, v] of Object.entries(params)) if (v) url.searchParams.set(k, v);
+  return url.toString();
+}
+
+function page(title: string, inner: string, status: 200 | 400 = 200): Response {
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:30rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}
+h1{font-size:1.25rem}code{background:#f0f0f0;padding:.1rem .3rem;border-radius:.2rem;word-break:break-all}
+ul{padding-left:1.2rem}button{font:inherit;padding:.5rem 1rem;margin:.25rem .5rem .25rem 0;border:1px solid #1a1a1a;
+border-radius:.3rem;background:#1a1a1a;color:#fff;cursor:pointer}button.deny{background:#fff;color:#1a1a1a}
+.muted{color:#666;font-size:.9rem}</style></head><body>${inner}</body></html>`;
+  return new Response(html, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
+}
+
+function failPage(message: string): Response {
+  return page("授权失败", `<h1>授权失败</h1><p>${escapeHtml(message)}</p>`, 400);
+}
+
+interface AuthRequestRow {
+  id: string;
+  csrf: string;
+  client_id: string;
+  redirect_uri: string;
+  state: string | null;
+  code_challenge: string;
+  scopes: string | null;
+  resource: string | null;
+  account_id: string | null;
+  expires_at: string;
+}
+
+async function loadRequest(c: C, id: string): Promise<AuthRequestRow | null> {
+  const row = await c.env.DB.prepare("SELECT * FROM auth_requests WHERE id = ? AND expires_at > ?")
+    .bind(id, nowIso())
+    .first<AuthRequestRow>();
+  if (!row) return null;
+  // 这个 cookie 把授权请求绑在发起它的那个浏览器上
+  const cookie = getCookie(c, COOKIE) ?? "";
+  return safeEqual(cookie, `${row.id}.${row.csrf}`) ? row : null;
+}
+
+function metadata(c: C) {
+  const base = origin(c);
+  return {
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    registration_endpoint: `${base}/oauth/register`,
+    revocation_endpoint: `${base}/oauth/revoke`,
+    device_authorization_endpoint: `${base}/oauth/device/code`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token", DEVICE_GRANT],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
+    scopes_supported: SCOPES,
+  };
+}
+
+export const oauth = new Hono<{ Bindings: Env }>();
+
+oauth.get("/.well-known/oauth-authorization-server", (c) => c.json(metadata(c)));
+oauth.get("/.well-known/oauth-authorization-server/*", (c) => c.json(metadata(c)));
+oauth.get("/.well-known/openid-configuration", (c) => c.json(metadata(c)));
+
+function protectedResource(c: C) {
+  const base = origin(c);
+  const suffix = new URL(c.req.url).pathname.replace("/.well-known/oauth-protected-resource", "");
+  return c.json({
+    resource: `${base}${suffix || "/mcp"}`,
+    authorization_servers: [base],
+    scopes_supported: SCOPES,
+    bearer_methods_supported: ["header"],
+    resource_name: "hire",
+  });
+}
+oauth.get("/.well-known/oauth-protected-resource", protectedResource);
+oauth.get("/.well-known/oauth-protected-resource/*", protectedResource);
+
+// 动态客户端注册
+oauth.post("/oauth/register", async (c) => {
+  let data: Record<string, unknown>;
+  try {
+    data = await c.req.json();
+  } catch {
+    return oauthError(c, "invalid_client_metadata", "请求体必须是 JSON。");
+  }
+  const uris = Array.isArray(data.redirect_uris) ? data.redirect_uris.filter((u) => typeof u === "string") : [];
+  if (!uris.length || uris.length > 10 || !uris.every(validRedirectUri)) {
+    return oauthError(
+      c,
+      "invalid_redirect_uri",
+      "redirect_uris 必须是 1 到 10 个地址：https、本机回环的 http，或客户端自定义协议。",
+    );
+  }
+  const method = typeof data.token_endpoint_auth_method === "string" ? data.token_endpoint_auth_method : "none";
+  if (!["none", "client_secret_post", "client_secret_basic"].includes(method)) {
+    return oauthError(c, "invalid_client_metadata", "不支持这种 token_endpoint_auth_method。");
+  }
+  const id = newId("cli");
+  const secret = method === "none" ? null : `hire_cs_${randomHex(24)}`;
+  const name = typeof data.client_name === "string" ? data.client_name.slice(0, 80) : null;
+  await c.env.DB.prepare(
+    "INSERT INTO oauth_clients (id, secret_hash, name, redirect_uris, created_at) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(id, secret ? await sha256Hex(secret) : null, name, JSON.stringify(uris), nowIso())
+    .run();
+  return c.json(
+    {
+      client_id: id,
+      ...(secret ? { client_secret: secret, client_secret_expires_at: 0 } : {}),
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      client_name: name,
+      redirect_uris: uris,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: method,
+    },
+    201,
+    { "Cache-Control": "no-store" },
+  );
+});
+
+// 授权：不出自己的登录页，直接跳去 GitHub
+oauth.get("/oauth/authorize", async (c) => {
+  const q = c.req.query();
+  const client = await c.env.DB.prepare("SELECT * FROM oauth_clients WHERE id = ?")
+    .bind(q.client_id ?? "")
+    .first<{ id: string; redirect_uris: string }>();
+  if (!client) return failPage("client_id 无效。请让客户端重新注册。");
+  const redirectUri = q.redirect_uri ?? "";
+  if (!redirectMatches(parseJson<string[]>(client.redirect_uris, []), redirectUri)) {
+    return failPage("redirect_uri 和客户端注册时登记的不一致。");
+  }
+  const back = (error: string, description: string) =>
+    c.redirect(redirectWith(redirectUri, { error, error_description: description, state: q.state }));
+  if (q.response_type !== "code") return back("unsupported_response_type", "只支持 response_type=code");
+  if (!q.code_challenge || (q.code_challenge_method ?? "plain") !== "S256") {
+    return back("invalid_request", "必须使用 PKCE，且 code_challenge_method=S256");
+  }
+  try {
+    githubConfig(c.env);
+  } catch {
+    return back("server_error", "服务端还没有配置 GitHub 登录");
+  }
+  const scopes = parseScopes(q.scope ?? "");
+  const id = newId("req");
+  const csrf = randomHex(24);
+  await c.env.DB.prepare(
+    `INSERT INTO auth_requests (id, csrf, client_id, redirect_uri, state, code_challenge, scopes, resource, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      csrf,
+      client.id,
+      redirectUri,
+      q.state ?? null,
+      q.code_challenge,
+      scopes.length ? JSON.stringify(scopes) : null,
+      q.resource ?? null,
+      isoAfter(REQUEST_TTL),
+    )
+    .run();
+  setCookie(c, COOKIE, `${id}.${csrf}`, {
+    httpOnly: true,
+    secure: new URL(c.req.url).protocol === "https:",
+    sameSite: "Lax",
+    path: "/oauth",
+    maxAge: REQUEST_TTL,
+  });
+  return c.redirect(authorizeUrl(c.env, `${origin(c)}/oauth/github/callback`, id));
+});
+
+// GitHub 回来之后，出一个确认页。没有这一步，任何注册过的客户端都能借用户已有的 GitHub 授权悄悄拿到令牌
+oauth.get("/oauth/github/callback", async (c) => {
+  const q = c.req.query();
+  const request = await loadRequest(c, q.state ?? "");
+  if (!request) return failPage("这次授权已过期，或者不是在这个浏览器里发起的。请回到客户端重新开始。");
+  if (!q.code) {
+    await c.env.DB.prepare("DELETE FROM auth_requests WHERE id = ?").bind(request.id).run();
+    return c.redirect(redirectWith(request.redirect_uri, { error: "access_denied", state: request.state }));
+  }
+  const ghToken = await exchangeCode(c.env, q.code, `${origin(c)}/oauth/github/callback`);
+  const user = ghToken ? await getUser(ghToken) : null;
+  if (!user) return failPage("向 GitHub 确认身份失败。请回到客户端重新开始。");
+  const accountId = await upsertAccount(c.env.DB, user.id, user.login);
+  await c.env.DB.prepare("UPDATE auth_requests SET account_id = ? WHERE id = ?").bind(accountId, request.id).run();
+
+  const client = await c.env.DB.prepare("SELECT name FROM oauth_clients WHERE id = ?")
+    .bind(request.client_id)
+    .first<{ name: string | null }>();
+  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
+  const fixedRole = roleOfResource(request.resource);
+  const list = (scopes: Scope[]) => `<ul>${scopes.map((s) => `<li>${escapeHtml(SCOPE_LABELS[s])}</li>`).join("")}</ul>`;
+  const button = (value: string, label: string, cls = "") =>
+    `<button name="decision" value="${value}" class="${cls}">${escapeHtml(label)}</button>`;
+
+  let choices: string;
+  if (requested.length) {
+    choices = `<p>它申请的权限：</p>${list(requested)}${button("approve", "授权")}`;
+  } else if (fixedRole) {
+    const label = fixedRole === "candidate" ? "求职者" : "招聘者";
+    choices = `<p>它将以${label}身份操作：</p>${list(ROLE_SCOPES[fixedRole])}${button(fixedRole, "授权")}`;
+  } else {
+    choices = `<p>选择让它用哪个身份操作。</p>
+<p><strong>求职者</strong></p>${list(ROLE_SCOPES.candidate)}${button("candidate", "以求职者身份授权")}
+<p><strong>招聘者</strong></p>${list(ROLE_SCOPES.recruiter)}${button("recruiter", "以招聘者身份授权")}<br>`;
+  }
+  let host = request.redirect_uri;
+  try {
+    const u = new URL(request.redirect_uri);
+    host = u.host || u.protocol;
+  } catch {}
+  return page(
+    "授权访问 hire",
+    `<h1>授权访问 hire</h1>
+<p>你已用 GitHub 账号 <strong>${escapeHtml(user.login)}</strong> 登录。</p>
+<p>客户端 <strong>${escapeHtml(client?.name ?? "未命名客户端")}</strong> 想访问你的 hire 账号。授权后会跳转到 <code>${escapeHtml(host)}</code>。</p>
+<form method="post" action="/oauth/consent">
+<input type="hidden" name="request_id" value="${escapeHtml(request.id)}">
+<input type="hidden" name="csrf" value="${escapeHtml(request.csrf)}">
+${choices}${button("deny", "拒绝", "deny")}
+</form>
+<p class="muted">如果你没有在某个 AI 客户端里主动添加 hire，请点拒绝。</p>`,
+  );
+});
+
+oauth.post("/oauth/consent", async (c) => {
+  const form = await body(c);
+  const request = await loadRequest(c, form.request_id ?? "");
+  if (!request || !request.account_id || !safeEqual(form.csrf ?? "", request.csrf)) {
+    return failPage("这次授权已过期或无效。请回到客户端重新开始。");
+  }
+  await c.env.DB.prepare("DELETE FROM auth_requests WHERE id = ?").bind(request.id).run();
+  deleteCookie(c, COOKIE, { path: "/oauth" });
+
+  const requested = parseScopes(parseJson<string[]>(request.scopes, []));
+  const fixedRole = roleOfResource(request.resource);
+  const decision = form.decision ?? "deny";
+  let scopes: Scope[] | null = null;
+  if (decision === "approve" && requested.length) scopes = requested;
+  else if (!requested.length && (decision === "candidate" || decision === "recruiter")) {
+    if (!fixedRole || fixedRole === decision) scopes = ROLE_SCOPES[decision];
+  }
+  if (!scopes) {
+    return c.redirect(redirectWith(request.redirect_uri, { error: "access_denied", state: request.state }), 303);
+  }
+  const code = `hire_ac_${randomHex(32)}`;
+  await c.env.DB.prepare(
+    `INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scopes, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      await sha256Hex(code),
+      request.client_id,
+      request.redirect_uri,
+      request.code_challenge,
+      request.account_id,
+      JSON.stringify(scopes),
+      isoAfter(CODE_TTL),
+    )
+    .run();
+  return c.redirect(redirectWith(request.redirect_uri, { code, state: request.state }), 303);
+});
+
+async function checkClient(c: C, form: Record<string, string>): Promise<{ id: string } | Response> {
+  let clientId = form.client_id ?? "";
+  let secret = form.client_secret ?? "";
+  const basic = /^Basic\s+(\S+)$/i.exec(c.req.header("Authorization") ?? "");
+  if (basic) {
+    try {
+      const [user, ...rest] = atob(basic[1]!).split(":");
+      clientId = decodeURIComponent(user ?? "");
+      secret = decodeURIComponent(rest.join(":"));
+    } catch {}
+  }
+  const client = await c.env.DB.prepare("SELECT id, secret_hash FROM oauth_clients WHERE id = ?")
+    .bind(clientId)
+    .first<{ id: string; secret_hash: string | null }>();
+  if (!client) return oauthError(c, "invalid_client", "client_id 无效。", 401);
+  if (client.secret_hash && !safeEqual(client.secret_hash, await sha256Hex(secret))) {
+    return oauthError(c, "invalid_client", "client_secret 不对。", 401);
+  }
+  return { id: client.id };
+}
+
+async function deviceGrant(c: C, form: Record<string, string>) {
+  const hash = await sha256Hex(form.device_code ?? "");
+  const row = await c.env.DB.prepare("SELECT * FROM device_requests WHERE device_hash = ?")
+    .bind(hash)
+    .first<{ github_device_code: string; scopes: string; expires_at: string }>();
+  const drop = () => c.env.DB.prepare("DELETE FROM device_requests WHERE device_hash = ?").bind(hash).run();
+  if (!row) return oauthError(c, "invalid_grant", "device_code 无效。");
+  if (row.expires_at <= nowIso()) {
+    await drop();
+    return oauthError(c, "expired_token", "设备码已过期，请重新申请。");
+  }
+  const result = await pollDevice(c.env, row.github_device_code);
+  if (!result.access_token) {
+    const error = result.error ?? "server_error";
+    if (error === "authorization_pending") return oauthError(c, error, "用户还没有在 GitHub 上输入用户码。稍后再试。");
+    if (error === "slow_down") return oauthError(c, error, "轮询太快了，把间隔加 5 秒。");
+    await drop();
+    if (error === "access_denied") return oauthError(c, error, "用户拒绝了授权。");
+    if (error === "expired_token") return oauthError(c, error, "设备码已过期，请重新申请。");
+    return oauthError(c, "invalid_grant", `GitHub 返回了错误：${error}`);
+  }
+  const user = await getUser(result.access_token);
+  if (!user) return oauthError(c, "invalid_grant", "向 GitHub 确认身份失败。");
+  await drop();
+  const accountId = await upsertAccount(c.env.DB, user.id, user.login);
+  const tokens = await issueTokens(c.env.DB, accountId, parseScopes(parseJson<string[]>(row.scopes, [])), null);
+  return c.json(tokens, 200, { "Cache-Control": "no-store" });
+}
+
+oauth.post("/oauth/token", async (c) => {
+  const form = await body(c);
+  const db = c.env.DB;
+  if (form.grant_type === DEVICE_GRANT) {
+    try {
+      return await deviceGrant(c, form);
+    } catch (err) {
+      if (err instanceof HireError) return oauthError(c, "server_error", err.message, 503);
+      throw err;
+    }
+  }
+
+  if (form.grant_type === "authorization_code") {
+    const client = await checkClient(c, form);
+    if (client instanceof Response) return client;
+    const row = await db
+      .prepare("UPDATE auth_codes SET used = 1 WHERE code_hash = ? AND used = 0 RETURNING *")
+      .bind(await sha256Hex(form.code ?? ""))
+      .first<{
+        client_id: string;
+        redirect_uri: string;
+        code_challenge: string;
+        account_id: string;
+        scopes: string;
+        expires_at: string;
+      }>();
+    if (!row || row.expires_at <= nowIso() || row.client_id !== client.id) {
+      return oauthError(c, "invalid_grant", "授权码无效、已用过或已过期。");
+    }
+    if (form.redirect_uri !== undefined && form.redirect_uri !== row.redirect_uri) {
+      return oauthError(c, "invalid_grant", "redirect_uri 和授权时的不一致。");
+    }
+    const challenge = await sha256Base64url(form.code_verifier ?? "");
+    if (!form.code_verifier || !safeEqual(challenge, row.code_challenge)) {
+      return oauthError(c, "invalid_grant", "code_verifier 校验失败。");
+    }
+    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), client.id);
+    return c.json(tokens, 200, { "Cache-Control": "no-store" });
+  }
+
+  if (form.grant_type === "refresh_token") {
+    const hash = await sha256Hex(form.refresh_token ?? "");
+    const existing = await db
+      .prepare("SELECT client_id FROM tokens WHERE refresh_hash = ? AND revoked = 0")
+      .bind(hash)
+      .first<{ client_id: string | null }>();
+    if (!existing) return oauthError(c, "invalid_grant", "刷新令牌无效或已用过。请重新登录。");
+    if (existing.client_id) {
+      const client = await checkClient(c, form);
+      if (client instanceof Response) return client;
+      if (client.id !== existing.client_id) return oauthError(c, "invalid_grant", "这个刷新令牌不属于这个客户端。");
+    }
+    // 刷新令牌一次有效：先作废旧的，再签新的
+    const row = await db
+      .prepare("UPDATE tokens SET revoked = 1 WHERE refresh_hash = ? AND revoked = 0 RETURNING *")
+      .bind(hash)
+      .first<{ account_id: string; client_id: string | null; scopes: string; refresh_expires_at: string }>();
+    if (!row || row.refresh_expires_at <= nowIso()) {
+      return oauthError(c, "invalid_grant", "刷新令牌无效或已过期。请重新登录。");
+    }
+    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), row.client_id);
+    return c.json(tokens, 200, { "Cache-Control": "no-store" });
+  }
+
+  return oauthError(c, "unsupported_grant_type", "只支持 authorization_code、refresh_token 和设备码。");
+});
+
+// 设备码：给命令行和技能包用。必须说明要哪些范围
+oauth.post("/oauth/device/code", async (c) => {
+  const form = await body(c);
+  const scopes = parseScopes(form.scope ?? "");
+  if (!scopes.length) {
+    return oauthError(
+      c,
+      "invalid_scope",
+      `scope 必填，用空格分隔。求职者用 "${ROLE_SCOPES.candidate.join(" ")}"，招聘者用 "${ROLE_SCOPES.recruiter.join(" ")}"。`,
+    );
+  }
+  let started;
+  try {
+    started = await startDevice(c.env);
+  } catch (err) {
+    if (err instanceof HireError) return oauthError(c, "server_error", err.message, 503);
+    throw err;
+  }
+  if (!started) return oauthError(c, "server_error", "向 GitHub 申请设备码失败。确认 GitHub 应用已开启 Device Flow。", 503);
+  const deviceCode = `hire_dc_${randomHex(32)}`;
+  await c.env.DB.prepare(
+    "INSERT INTO device_requests (device_hash, github_device_code, scopes, poll_interval, expires_at) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(await sha256Hex(deviceCode), started.device_code, JSON.stringify(scopes), started.interval, isoAfter(started.expires_in))
+    .run();
+  return c.json(
+    {
+      device_code: deviceCode,
+      user_code: started.user_code,
+      verification_uri: started.verification_uri,
+      expires_in: started.expires_in,
+      interval: started.interval,
+      scope: scopes.join(" "),
+    },
+    200,
+    { "Cache-Control": "no-store" },
+  );
+});
+
+oauth.post("/oauth/revoke", async (c) => {
+  const form = await body(c);
+  const hash = await sha256Hex(form.token ?? "");
+  await c.env.DB.prepare("UPDATE tokens SET revoked = 1 WHERE access_hash = ? OR refresh_hash = ?").bind(hash, hash).run();
+  return c.body(null, 200);
+});
+
+// 测试登录：只在 DEV_LOGIN=1 时存在，线上不开
+oauth.post("/oauth/dev/token", async (c) => {
+  if (c.env.DEV_LOGIN !== "1") return c.notFound();
+  const form = await body(c);
+  const login = (form.login ?? "").trim();
+  if (!/^[\w-]{1,39}$/.test(login)) return oauthError(c, "invalid_request", "login 必填，只能包含字母、数字、下划线和连字符。");
+  const scopes = form.scope ? parseScopes(form.scope) : [...SCOPES];
+  const digest = await sha256Hex(`dev:${login.toLowerCase()}`);
+  const accountId = await upsertAccount(c.env.DB, -Number.parseInt(digest.slice(0, 12), 16), login);
+  return c.json(await issueTokens(c.env.DB, accountId, scopes, null), 200, { "Cache-Control": "no-store" });
+});
