@@ -11,6 +11,7 @@ import {
   EXPERIENCES,
   INTERN_TYPES,
   RECRUIT_TYPES,
+  REJECT_REASONS,
   SALARY_UNITS,
   keysOf,
   type RecruitType,
@@ -77,6 +78,16 @@ const jobShape = {
   deadline: z.iso.date().nullable().optional().describe("截止日期，YYYY-MM-DD"),
   source_url: z.url().max(500).nullable().optional().describe("参考来源链接"),
   custom_fields: z.record(z.string().max(40), z.string().max(500)).optional().describe("自定义键值对，最多 10 项"),
+  questions: z
+    .array(
+      z.strictObject({
+        text: str(200).describe("问题"),
+        options: z.array(str(60)).min(2).max(6).optional().describe("可选答案。传了就是单选题，不传是问答题"),
+      }),
+    )
+    .max(3)
+    .optional()
+    .describe("筛选问题，最多 3 个。求职者投递时必须逐个回答"),
 };
 
 export const JobFields = z.strictObject(jobShape);
@@ -123,7 +134,7 @@ export function checkJob(job: JobFields): void {
   if (issues.length) throw invalid(issues);
 }
 
-export const JobsSearchInput = z.strictObject({
+const jobFilterShape = {
   q: z.string().trim().max(100).optional().describe("关键词，空格分隔表示都要包含"),
   recruit_type: RecruitTypeEnum.optional(),
   category: z
@@ -140,9 +151,23 @@ export const JobsSearchInput = z.strictObject({
   salary_unit: SalaryUnitEnum.optional(),
   skills: z.array(str(30)).max(10).optional().describe("技能标签，命中任意一个即可"),
   company_id: id("公司").optional(),
+  active_within_days: z.int().min(1).max(90).optional().describe("只返回招聘者最近这么多天内活跃过的岗位"),
+};
+
+export const JobFilters = z.strictObject(jobFilterShape);
+export type JobFilters = z.infer<typeof JobFilters>;
+
+export const JobsSearchInput = z.strictObject({
+  ...jobFilterShape,
   mine: z.boolean().optional().describe("招聘者专用：true 表示列出自己名下所有状态的岗位"),
   ...pageShape,
 });
+
+export const SubscriptionCreateInput = z.strictObject({
+  name: str(40).describe("给这组条件起个名字，如 北京后端实习"),
+  filters: JobFilters.describe("搜索条件，和 jobs_search 的入参相同，至少传一项"),
+});
+export const SubscriptionDeleteInput = z.strictObject({ subscription_id: id("订阅") });
 
 // ---------- 简历 ----------
 
@@ -225,6 +250,7 @@ export const CandidatesSearchInput = z.strictObject({
   grad_year: z.int().min(1980).max(2100).optional(),
   days_per_week_min: z.int().min(1).max(7).optional().describe("每周至少能到岗几天"),
   skills: z.array(str(30)).max(10).optional().describe("技能标签，命中任意一个即可"),
+  active_within_days: z.int().min(1).max(90).optional().describe("只返回最近这么多天内活跃过的求职者"),
   ...pageShape,
 });
 
@@ -239,6 +265,11 @@ const AsRole = z
 export const ApplicationCreateInput = z.strictObject({
   job_id: id("岗位"),
   custom_resume: ResumeContent.optional().describe("针对这个岗位改写的简历，只有这个岗位的招聘者能看。不传就用公开简历"),
+  answers: z
+    .array(str(500))
+    .max(3)
+    .optional()
+    .describe("按顺序回答岗位的筛选问题，每题一项。岗位有 questions 时必填，问题用 job_get 查看"),
   note,
 });
 
@@ -256,6 +287,27 @@ export const JobApplicationsListInput = z.strictObject({
 export const ApplicationGetInput = z.strictObject({ application_id: id("投递"), as: AsRole });
 
 export const ApplicationActionInput = z.strictObject({ application_id: id("投递"), note });
+
+export const ApplicationRejectInput = z.strictObject({
+  application_id: id("投递"),
+  reason: z.enum(keysOf(REJECT_REASONS)).describe(`拒绝原因：${ENUM_DOCS.reject_reason}`),
+  note,
+});
+
+export const OfferCreateInput = z.strictObject({
+  application_id: id("投递"),
+  start_date: z.iso.date().optional().describe("入职日期，YYYY-MM-DD"),
+  salary: z.int().min(0).optional().describe("录用薪资，必须和 salary_unit 一起传"),
+  salary_unit: SalaryUnitEnum.optional(),
+  reply_by: z.iso.date().optional().describe("希望对方在这一天前答复，YYYY-MM-DD"),
+  note,
+});
+
+export const OfferRespondInput = z.strictObject({
+  application_id: id("投递"),
+  accept: z.boolean().describe("true=接受录用，false=拒绝"),
+  note,
+});
 
 export const InvitationCreateInput = z.strictObject({
   application_id: id("投递").optional().describe("回应一条已有的投递时传它"),

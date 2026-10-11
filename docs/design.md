@@ -88,6 +88,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `intro` | 文本 | 可空，1000 字以内 |
 | `verified` | 布尔 | 固定为 `false` |
 | `contact_email` | 字符串 | 邀约被接受后，求职者能看到 |
+| `active_at` | 时间 | 招聘者最近活跃时间，见“活跃度” |
 
 一家公司只属于创建它的那个账号。通过接口，一个账号只能创建和修改一家公司。演示数据导入时会在一个账号下挂多家公司，这时发布岗位要用 `company_id` 指定是哪一家。
 
@@ -122,6 +123,8 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `status` | 枚举 | `open`、`paused`、`closed` |
 | `source_url` | 字符串 | 模拟数据的参考来源，可空 |
 | `custom_fields` | 键值对 | 最多 10 项 |
+| `questions` | 对象数组 | 筛选问题，最多 3 个，见“筛选问题” |
+| `detail_views` | 整数 | 详情被别人读取的次数，不去重，只在 `job_stats` 里返回 |
 
 校验规则：`recruit_type` 是两种实习之一时，`days_per_week` 和 `min_months` 必填。其他类型不接受这两个字段。
 
@@ -142,6 +145,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `projects` | 对象数组 | 是 | 名称、角色、起止年月、内容、链接 |
 | `links` | 字符串数组 | 是 | GitHub、个人网站 |
 | `expectation` | 对象 | 是 | 见下 |
+| `active_at` | 时间 | 是 | 最近活跃时间，见“活跃度” |
 | `resume_public` | 布尔 | — | 关闭后不出现在搜索里 |
 | `phone` | 字符串 | 否 | |
 | `email` | 字符串 | 否 | |
@@ -162,11 +166,51 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 | `custom_resume` | 对象 | 可空。投递时 agent 针对这个岗位改写的简历，结构同公开简历，只有这个岗位的招聘者能看 |
 | `invitation` | 对象 | 邀约内容，见下 |
 | `chosen_slot` | 时间 | 求职者接受时选的面试时间 |
+| `answers` | 对象数组 | 筛选问题的回答，连题目一起存，岗位之后改了问题也不受影响 |
+| `responded_at` | 时间 | 招聘者第一次处理这条投递的时间，用来算处理比例 |
+| `reject_reason` | 枚举 | 招聘者拒绝时选的原因，见“投递状态” |
+| `offer` | 对象 | 录用内容：`start_date`、`salary`、`salary_unit`、`reply_by`，都可空 |
 | `closed_by` | 枚举 | `candidate`、`recruiter`、`system`，结束时填 |
 
 每次状态变化在 `application_logs` 里记一行：谁、什么时候、从哪个状态到哪个状态、备注。备注 500 字以内。
 
 `invitation` 的字段：`mode`（`online`、`onsite`、`phone`）、`slots`（1 到 5 个可选时间）、`location`（线下地址或会议说明，可空）。
+
+### 订阅 `subscriptions`
+
+求职者保存的一组岗位搜索条件，每个账号最多 5 个。字段：`id`、`name`、`filters`（和岗位搜索的过滤项相同）、`cursor_at`（已经算到哪个发布时间）。
+
+## 活跃度
+
+BOSS 直聘靠“刚刚活跃”“回复率”让求职者避开没人管的岗位。这里给 agent 同样的信号。
+
+| 信号 | 在哪 | 怎么算 |
+|---|---|---|
+| 招聘者最近活跃时间 | `jobs_search` 的 `recruiter_active_at`，`job_get` 的 `recruiter.active_at` | 账号以招聘者身份调过接口的时间 |
+| 处理比例 | `job_get` 的 `recruiter.response_rate` | 这家公司近 90 天收到的投递里，招聘者查看、邀约或拒绝过的比例。没有投递时为 `null` |
+| 平均处理时长 | `job_get` 的 `recruiter.avg_response_hours` | 从投递到第一次处理的平均小时数 |
+| 求职者最近活跃时间 | `candidates_search` 和 `candidate_get` 的 `active_at` | 账号以求职者身份调过接口的时间 |
+
+两个搜索都有 `active_within_days` 过滤项。
+
+活跃时间只认身份明确的调用。单一身份的工具算那个身份；`events_poll` 和 `quota_get` 算令牌带的全部身份；两种身份都能调的工具（如 `jobs_search`）不算。一小时内只写一次库。
+
+## 筛选问题
+
+agent 可以批量投递，这是 agent 平台特有的风险。除了每天 20 次的限额，岗位还可以带最多 3 个筛选问题，投递时必须逐个回答。
+
+- 每个问题有 `text`，可选 `options`（2 到 6 项）。有 `options` 是单选题，回答必须是其中一项；没有是问答题，500 字以内。
+- `application_create` 的 `answers` 是字符串数组，顺序和岗位的 `questions` 一致。
+- 没答或答错时返回 `validation_failed`，`details.questions` 里带着全部问题，agent 不用再查一次。
+- 招聘者主动邀约时不需要回答。
+
+这相当于 Moka 的申请表。它仍然是结构化的一问一答，不是自由对话。
+
+## 订阅
+
+BOSS 直聘用推荐把新岗位推给求职者。这里服务端不打分，改成订阅：求职者保存一组搜索条件，之后有新发布的岗位符合条件时，`events_poll` 里出现一条 `job.matched` 事件。
+
+匹配在拉取事件时才算，不在发布岗位时算。每次拉取最多查 5 个订阅，发布岗位不用遍历所有人的订阅。订阅只对创建之后发布的岗位生效，每个订阅每次拉取最多写 20 条事件。
 
 ## 可见性
 
@@ -176,8 +220,8 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 |---|---|
 | 任何招聘者 | 公开简历的全部内容，不含手机、邮箱、PDF |
 | 收到投递的招聘者 | 另加这次投递的 `custom_resume` |
-| 投递状态为“已接受”的招聘者 | 另加手机、邮箱、PDF 下载 |
-| 投递状态为“已接受”的求职者 | 公司的 `contact_email` |
+| 投递状态为“已接受”“已发录用”“已录用”的招聘者 | 另加手机、邮箱、PDF 下载 |
+| 投递状态为“已接受”“已发录用”“已录用”的求职者 | 公司的 `contact_email` |
 
 `resume_public` 关闭时，求职者不出现在搜索结果里。已经收到他投递的招聘者仍然能看他的简历。
 
@@ -185,7 +229,7 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 ## 投递状态
 
-共 7 个状态，后 4 个是终态。
+共 9 个状态，后 4 个是终态。
 
 | 状态 | 含义 |
 |---|---|
@@ -193,7 +237,9 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | `viewed` 已查看 | 招聘者读过这条投递的详情 |
 | `invited` 已邀约 | 招聘者发出了面试邀约 |
 | `accepted` 已接受 | 求职者接受了邀约，双方可见联系方式 |
-| `rejected` 已拒绝 | 招聘者拒绝了投递，或求职者拒绝了邀约 |
+| `offered` 已发录用 | 面试之后，招聘者发出了录用 |
+| `hired` 已录用 | 求职者接受了录用 |
+| `rejected` 已拒绝 | 招聘者拒绝了投递或撤回了录用，或求职者拒绝了邀约或录用 |
 | `withdrawn` 已撤回 | 求职者主动撤回 |
 | `closed` 已关闭 | 岗位关闭，系统结束了这条投递 |
 
@@ -205,11 +251,18 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | — | `invited` | 招聘者 | 主动邀约，跳过前两步 |
 | `applied` | `viewed` | 招聘者 | 第一次读投递详情，自动变化 |
 | `applied`、`viewed` | `invited` | 招聘者 | 发出邀约 |
-| `applied`、`viewed`、`invited` | `rejected` | 招聘者 | 拒绝 |
 | `invited` | `accepted` | 求职者 | 接受，并选一个时间 |
 | `invited` | `rejected` | 求职者 | 拒绝邀约 |
-| `applied`、`viewed`、`invited` | `withdrawn` | 求职者 | 撤回 |
-| 任何非终态 | `closed` | 系统 | 岗位被关闭 |
+| `accepted` | `offered` | 招聘者 | 发出录用 |
+| `offered` | `hired` | 求职者 | 接受录用 |
+| `offered` | `rejected` | 求职者 | 拒绝录用 |
+| 任何非终态 | `rejected` | 招聘者 | 拒绝，必须选原因 |
+| 任何非终态 | `withdrawn` | 求职者 | 撤回 |
+| `applied`、`viewed`、`invited` | `closed` | 系统 | 岗位被关闭 |
+
+招聘者拒绝时必须从下面选一个原因，求职者能看到：`skills_mismatch`（技能不匹配）、`experience_mismatch`（经历不匹配）、`education_mismatch`（学历或届别不符）、`availability`（到岗时间或每周天数不合适）、`interview_failed`（面试未通过）、`position_filled`（岗位已招满）、`other`（其他）。
+
+关闭岗位只结束还没约上面试的投递。已接受邀约和已发录用的投递继续走完。
 
 其他变化一律返回 `invalid_transition` 错误，并在错误里带上当前状态。
 
@@ -225,15 +278,18 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | `application.viewed` | 求职者 | 投递被查看 |
 | `invitation.created` | 求职者 | 收到邀约 |
 | `invitation.accepted` | 招聘者 | 邀约被接受 |
-| `application.rejected` | 对方 | 任一方拒绝 |
+| `offer.created` | 求职者 | 收到录用 |
+| `offer.accepted` | 招聘者 | 录用被接受 |
+| `application.rejected` | 对方 | 任一方拒绝。招聘者拒绝时带 `reason` |
 | `application.withdrawn` | 招聘者 | 求职者撤回 |
 | `application.closed` | 求职者 | 岗位关闭 |
+| `job.matched` | 求职者 | 订阅命中了新岗位。没有投递编号，带 `job_id` 和 `subscription_id` |
 
 事件带自增序号。轮询时传 `after=<上次拿到的最大序号>`，服务端返回之后的事件，一次最多 100 条。事件保留 30 天。
 
 事件里只放投递编号、岗位标题、对方名称和备注。详情让 agent 再调投递详情接口。
 
-建议的轮询间隔写在技能包里：有未结束的投递时每 10 分钟一次，否则不轮询。
+建议的轮询间隔写在技能包里：有未结束的投递或有订阅时每 10 分钟一次，否则不轮询。
 
 ## 限额
 
@@ -313,6 +369,10 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `applications_list` | `GET /applications` | 是 | `candidate:read` |
 | `application_withdraw` | `POST /applications/{id}/withdraw` | 否 | `candidate:apply` |
 | `invitation_respond` | `POST /applications/{id}/respond` | 否 | `candidate:apply` |
+| `offer_respond` | `POST /applications/{id}/offer/respond` | 否 | `candidate:apply` |
+| `subscription_create` | `POST /subscriptions` | 否 | `candidate:write` |
+| `subscriptions_list` | `GET /subscriptions` | 是 | `candidate:read` |
+| `subscription_delete` | `POST /subscriptions/{id}/delete` | 否 | `candidate:write` |
 
 ### 招聘者
 
@@ -323,10 +383,12 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `job_create` | `POST /jobs` | 否 | `recruiter:write` |
 | `job_update` | `PATCH /jobs/{id}` | 否 | `recruiter:write` |
 | `job_close` | `POST /jobs/{id}/close` | 否 | `recruiter:write` |
+| `job_stats` | `GET /jobs/{id}/stats` | 是 | `recruiter:read` |
 | `candidates_search` | `GET /candidates` | 是 | `recruiter:read` |
 | `candidate_get` | `GET /candidates/{id}` | 是 | `recruiter:read` |
 | `job_applications_list` | `GET /jobs/{id}/applications` | 是 | `recruiter:read` |
 | `invitation_create` | `POST /invitations` | 否 | `recruiter:invite` |
+| `offer_create` | `POST /applications/{id}/offer` | 否 | `recruiter:invite` |
 | `application_reject` | `POST /applications/{id}/reject` | 否 | `recruiter:invite` |
 
 ### 两种身份共用
@@ -339,32 +401,34 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | `events_poll` | `GET /events` | 是 | 任意 |
 | `quota_get` | `GET /quota` | 是 | 任意 |
 
-共 23 个工具，其中 10 个只读。求职者令牌能看到 13 个，招聘者令牌能看到 15 个。
+共 29 个工具，其中 12 个只读。求职者令牌和招聘者令牌各能看到 17 个。
 
 `application_get` 没有标为只读：招聘者第一次调用时，投递会从“已投递”变成“已查看”，并给求职者发一条事件。它是幂等的，重复调用不再产生变化。
 
 另有两个下载 PDF 的地址，只有 REST，没有对应的工具：
 
 - `GET /me/resume/pdf`：求职者下载自己上传的 PDF。
-- `GET /applications/{id}/resume.pdf`：招聘者下载求职者的 PDF，投递必须是“已接受”。
+- `GET /applications/{id}/resume.pdf`：招聘者下载求职者的 PDF，投递必须是“已接受”“已发录用”或“已录用”。
 
 几个容易写错的细节：
 
 - `profile_update` 是部分更新，只改传入的字段。数组字段整体替换。
 - `resume_upload` 在 MCP 里接收 base64 内容。在 REST 里除了同样的 JSON，也接收 `multipart/form-data`（字段名 `file`）和直接发送的 PDF 内容。
-- `application_create` 的入参是 `job_id`、可选的 `custom_resume`、可选的 `note`。姓名、学校、学历、毕业年份四项填齐后才能投递。
+- `application_create` 的入参是 `job_id`、可选的 `custom_resume`、可选的 `note`，岗位有筛选问题时还要 `answers`。姓名、学校、学历、毕业年份四项填齐后才能投递。
 - `invitation_create` 有两种用法：传 `application_id` 是回应投递，传 `job_id` 加 `candidate_id` 是主动邀约。后一种会新建一条投递。
 - `invitation_respond` 的入参是 `accept`（布尔）、接受时必填的 `slot`、可选的 `note`。`slot` 必须是邀约里给出的时间之一。
-- `job_close` 会把这个岗位下所有未结束的投递改成“已关闭”。
+- `job_close` 会把这个岗位下还没约上面试的投递改成“已关闭”。
+- `application_reject` 的 `reason` 必填。
+- `job_stats` 返回漏斗：`applied`（求职者投递数）、`responded`（处理过的）、`invited`、`accepted`、`offered`、`hired`（走到过这一步的投递数），另有各状态当前的条数和拒绝原因分布。
 - `job_get` 返回的对象里带公司的基本资料，agent 不需要再查一次。
 - `jobs_search` 传 `mine=true` 时，列出调用者名下所有状态的岗位，需要 `recruiter:read`。
 - 同一个账号既是求职者又是岗位的招聘者时，`application_get` 按令牌的范围决定用哪个身份看。令牌两种范围都有时，用 `as` 参数指定。
 
 ### 搜索
 
-岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`、`mine`。只返回 `open` 状态的岗位，`mine=true` 时除外。
+岗位搜索的过滤项：`q`（关键词）、`recruit_type`、`category`、`city`、`remote`、`degree`、`grad_year`、`days_per_week_max`、`min_months_max`、`salary_min`、`salary_unit`、`skills`、`company_id`、`active_within_days`、`mine`。只返回 `open` 状态的岗位，`mine=true` 时除外。
 
-求职者搜索的过滤项：`q`、`recruit_type`、`city`、`degree`、`grad_year`、`days_per_week_min`、`skills`。只返回公开了简历的求职者。
+求职者搜索的过滤项：`q`、`recruit_type`、`city`、`degree`、`grad_year`、`days_per_week_min`、`skills`、`active_within_days`。只返回公开了简历的求职者。
 
 两个搜索都用游标分页，每页默认 20 条、最多 50 条，按更新时间倒序。服务端不打分。结果里的列表项只含摘要字段，详情另取。
 
@@ -466,6 +530,7 @@ node scripts/seed.mjs --url <服务地址> --remote
 3. 会话 A 轮询到新投递，查看详情，发出带 3 个可选时间的邀约。
 4. 会话 B 轮询到邀约，接受并选一个时间。
 5. 会话 A 读到求职者的手机和邮箱。会话 B 读到公司的联系邮箱。
+6. 会话 A 发出录用，会话 B 接受。会话 A 用 `job_stats` 看这个岗位的漏斗。
 
 全程只有两次 GitHub 授权需要人操作。
 

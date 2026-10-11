@@ -135,12 +135,29 @@ export const APPLICATION_STATUSES = {
   viewed: "已查看",
   invited: "已邀约",
   accepted: "已接受",
+  offered: "已发录用",
+  hired: "已录用",
   rejected: "已拒绝",
   withdrawn: "已撤回",
   closed: "已关闭",
 } as const;
 export type ApplicationStatus = keyof typeof APPLICATION_STATUSES;
-export const ACTIVE_STATUSES: ApplicationStatus[] = ["applied", "viewed", "invited"];
+/** 还没结束的投递。同一个岗位同一个人只能有一条。 */
+export const ACTIVE_STATUSES: ApplicationStatus[] = ["applied", "viewed", "invited", "accepted", "offered"];
+/** 还没约上面试的投递。关闭岗位时只结束这些。 */
+export const PENDING_STATUSES: ApplicationStatus[] = ["applied", "viewed", "invited"];
+/** 这些状态下双方能看到对方的联系方式。 */
+export const CONTACT_STATUSES: ApplicationStatus[] = ["accepted", "offered", "hired"];
+
+export const REJECT_REASONS = {
+  skills_mismatch: "技能不匹配",
+  experience_mismatch: "经历不匹配",
+  education_mismatch: "学历或届别不符",
+  availability: "到岗时间或每周天数不合适",
+  interview_failed: "面试未通过",
+  position_filled: "岗位已招满",
+  other: "其他",
+} as const;
 
 export function keysOf<T extends Record<string, unknown>>(obj: T): [keyof T & string, ...(keyof T & string)[]] {
   return Object.keys(obj) as [keyof T & string, ...(keyof T & string)[]];
@@ -160,6 +177,7 @@ export const ENUM_DOCS = {
   stage: describe(COMPANY_STAGES),
   salary_unit: describe(SALARY_UNITS),
   status: describe(APPLICATION_STATUSES),
+  reject_reason: describe(REJECT_REASONS),
   category: Object.entries(CATEGORY_TREE)
     .map(([l1, g]) => `${l1}（${g.name}）: ${Object.entries(g.children).map(([k, v]) => `${l1}.${k}=${v}`).join("，")}`)
     .join("；"),

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { authenticate } from "./auth/tokens";
 import type { Ctx, Env } from "./env";
 import { HireError, invalid } from "./errors";
-import { OPS, requireScope } from "./ops";
+import { OPS, requireScope, touchActive } from "./ops";
 import { storePdf } from "./ops/candidates";
 import type { Op } from "./registry";
 import { parseInput } from "./schemas";
@@ -84,11 +84,15 @@ export function mountRest(app: Hono<{ Bindings: Env }>): void {
       const ctx = await makeCtx(c);
       requireScope(op, ctx.auth);
       if (op.name === "resume_upload" && !(c.req.header("Content-Type") ?? "").includes("application/json")) {
-        return c.json(await uploadPdf(c, ctx));
+        const uploaded = await uploadPdf(c, ctx);
+        await touchActive(ctx, op);
+        return c.json(uploaded);
       }
       const raw = op.method === "GET" ? coerceQuery(op, c.req.queries()) : await jsonBody(c);
       const input = parseInput(op.input, { ...raw, ...c.req.param() });
-      return c.json((await op.handler(ctx, input)) as object);
+      const result = (await op.handler(ctx, input)) as object;
+      await touchActive(ctx, op);
+      return c.json(result);
     });
   }
 }

@@ -1,7 +1,7 @@
 import type { Context } from "hono";
 import type { Env, Role } from "./env";
 import { HireError } from "./errors";
-import { OPS, opsFor, requireScope } from "./ops";
+import { OPS, opsFor, requireScope, touchActive } from "./ops";
 import { inputSchema, makeCtx } from "./rest";
 import { parseInput } from "./schemas";
 
@@ -11,10 +11,10 @@ const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INFO = { name: "hire", title: "hire 招聘平台", version: "0.1.0" };
 
 const INSTRUCTIONS = `hire 是给 AI agent 用的招聘平台，没有网页。你代表一位求职者或招聘者操作。
-求职者：先 profile_get 看资料，缺什么用 profile_update 补；用 jobs_search 按硬条件过滤，再用 job_get 读详情自己判断；application_create 投递。
-招聘者：先 company_get，没有公司就 company_upsert；job_create 发岗位；job_applications_list 和 application_get 看投递；invitation_create 发邀约。
-双方用 events_poll 了解进展，有未结束的投递时每 10 分钟一次即可。
-投递、回应邀约、发邀约、拒绝、关闭岗位都会被对方看到且不能撤销，执行前先让用户确认。
+求职者：先 profile_get 看资料，缺什么用 profile_update 补；用 jobs_search 按硬条件过滤，再用 job_get 读详情自己判断；岗位有筛选问题时先问用户再 application_create 投递；想持续关注就 subscription_create 订阅。
+招聘者：先 company_get，没有公司就 company_upsert；job_create 发岗位；job_applications_list 和 application_get 看投递；invitation_create 发邀约；面试后 offer_create 发录用或 application_reject 拒绝；job_stats 看数据。
+双方用 events_poll 了解进展，有未结束的投递或订阅时每 10 分钟一次即可。
+投递、回应邀约、发邀约、发录用、回应录用、拒绝、关闭岗位都会被对方看到且不能撤销，执行前先让用户确认。
 简历里只写用户确认过的事实。遇到 quota_exceeded 就停下，不要重试。`;
 
 interface RpcRequest {
@@ -106,6 +106,7 @@ export async function handleMcp(c: C, role?: Role): Promise<Response> {
           requireScope(op, ctx.auth);
           const input = parseInput(op.input, req.params?.arguments ?? {});
           const result = (await op.handler(ctx, input)) as Record<string, unknown>;
+          await touchActive(ctx, op);
           return ok({ content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result });
         } catch (err) {
           if (err instanceof HireError) {

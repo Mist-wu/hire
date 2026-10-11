@@ -24,20 +24,20 @@ describe("MCP", () => {
     const candidateTools = await names(seeker);
     expect(candidateTools).toContain("application_create");
     expect(candidateTools).not.toContain("job_create");
-    expect(candidateTools).toHaveLength(13);
-    expect(await names(await login(name, RECRUITER))).toHaveLength(15);
+    expect(candidateTools).toHaveLength(17);
+    expect(await names(await login(name, RECRUITER))).toHaveLength(17);
     const all = await login(name);
-    expect(await names(all)).toHaveLength(23);
-    expect(await names(all, "/mcp/recruiter")).toHaveLength(15);
+    expect(await names(all)).toHaveLength(29);
+    expect(await names(all, "/mcp/recruiter")).toHaveLength(17);
     expect(await names(await login(name, "candidate:read"))).toEqual([
-      "profile_get", "jobs_search", "job_get", "applications_list", "application_get", "events_poll", "quota_get",
+      "profile_get", "jobs_search", "job_get", "subscriptions_list", "applications_list", "application_get", "events_poll", "quota_get",
     ]);
 
     const tools = (await mcp(all, "tools/list", {})).data.result.tools;
     const search = tools.find((t: any) => t.name === "jobs_search");
     expect(search.annotations.readOnlyHint).toBe(true);
     expect(search.inputSchema.properties.recruit_type.enum).toContain("intern_daily");
-    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(10);
+    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(12);
     expect(tools.find((t: any) => t.name === "application_get").annotations.readOnlyHint).toBe(false);
   });
 
@@ -75,7 +75,7 @@ describe("MCP", () => {
     const client = new Client({ name: "test-client", version: "1.0.0" });
     await client.connect(transport);
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(13);
+    expect(tools).toHaveLength(17);
     const updated = await client.callTool({ name: "profile_update", arguments: profile });
     expect((updated.structuredContent as any).profile.name).toBe("林晓");
     const result = await client.callTool({ name: "jobs_search", arguments: { city: "北京", limit: 1 } });

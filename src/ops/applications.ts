@@ -5,19 +5,28 @@ import { defineOp } from "../registry";
 import {
   ApplicationActionInput,
   ApplicationCreateInput,
+  ApplicationRejectInput,
   ApplicationGetInput,
   ApplicationsListInput,
   EventsPollInput,
   InvitationCreateInput,
   InvitationRespondInput,
   JobApplicationsListInput,
+  OfferCreateInput,
+  OfferRespondInput,
   QuotaGetInput,
 } from "../schemas";
 import { addCursor, paginate, type Where } from "../search";
-import { ACTIVE_STATUSES, APPLICATION_STATUSES, type ApplicationStatus } from "../taxonomy";
+import {
+  ACTIVE_STATUSES,
+  APPLICATION_STATUSES,
+  CONTACT_STATUSES,
+    type ApplicationStatus,
+} from "../taxonomy";
 import { beijingDay, newId, nowIso, parseJson, randomHex } from "../util";
 import { candidatePublic, loadCandidate, missingForApply, pdfInfo } from "./candidates";
 import { loadJob } from "./jobs";
+import { deliverMatches } from "./subscriptions";
 
 const REAPPLY_DAYS = 7;
 
@@ -30,6 +39,10 @@ interface AppRow {
   custom_resume: string | null;
   invitation: string | null;
   chosen_slot: string | null;
+  answers: string | null;
+  responded_at: string | null;
+  reject_reason: string | null;
+  offer: string | null;
   closed_by: string | null;
   ended_at: string | null;
   rev: string;
@@ -48,6 +61,41 @@ interface Invitation {
   mode: string;
   slots: string[];
   location: string | null;
+}
+
+interface Answer {
+  question: string;
+  answer: string;
+}
+
+interface Question {
+  text: string;
+  options?: string[];
+}
+
+/** 对照岗位的筛选问题检查回答，返回连同题目一起存下来的快照。 */
+function checkAnswers(questions: Question[], answers: string[] | undefined): Answer[] {
+  if (!questions.length) {
+    if (answers?.length) throw invalid([{ field: "answers", message: "这个岗位没有筛选问题，不要传 answers。" }]);
+    return [];
+  }
+  const issues: { field: string; message: string }[] = [];
+  if (!answers || answers.length !== questions.length) {
+    issues.push({ field: "answers", message: `这个岗位有 ${questions.length} 个筛选问题，answers 要按顺序逐个回答。` });
+  } else {
+    questions.forEach((q, i) => {
+      if (q.options && !q.options.includes(answers[i]!)) {
+        issues.push({ field: `answers.${i}`, message: `这是单选题，只能填：${q.options.join("、")}` });
+      }
+    });
+  }
+  if (issues.length) {
+    throw new HireError("validation_failed", "筛选问题没有答完整。把 details.questions 里的问题问清楚用户后再投递。", {
+      fields: issues,
+      questions,
+    });
+  }
+  return questions.map((q, i) => ({ question: q.text, answer: answers![i]! }));
 }
 
 const APP_SELECT = `
@@ -81,13 +129,14 @@ function mustOwn(ctx: Ctx, app: AppRow, role: Role): void {
   if (owner !== ctx.auth.accountId) throw notFound("投递");
 }
 
-function eventPayload(app: AppRow, to: Role, status: ApplicationStatus, note?: string) {
+function eventPayload(app: AppRow, to: Role, status: ApplicationStatus, note?: string, reason?: string | null) {
   return {
     job_id: app.job_id,
     job_title: app.job_title,
     counterpart: to === "candidate" ? app.company_name : (app.candidate_name ?? "求职者"),
     status,
     note: note ?? null,
+    ...(reason ? { reason } : {}),
   };
 }
 
@@ -98,7 +147,7 @@ interface TransitionOpts {
   event: { to: Role; type: string };
 }
 
-const TERMINAL: ApplicationStatus[] = ["accepted", "rejected", "withdrawn", "closed"];
+const TERMINAL: ApplicationStatus[] = ["hired", "rejected", "withdrawn", "closed"];
 
 /**
  * 改状态、记日志、发事件，三件事在一个 batch 里。
@@ -123,8 +172,10 @@ async function transition(
   const set: Record<string, string | null> = { ...opts.set };
   if (TERMINAL.includes(to)) {
     set.ended_at = now;
-    if (to !== "accepted") set.closed_by = opts.actor;
+    if (to !== "hired") set.closed_by = opts.actor;
   }
+  // 招聘者第一次处理求职者的投递，记下时间，用来算处理比例
+  if (opts.actor === "recruiter" && app.initiated_by === "candidate" && !app.responded_at) set.responded_at = now;
   const cols = Object.keys(set);
   const recipient = opts.event.to === "candidate" ? app.candidate_id : app.owner_account_id;
   const guard = "WHERE EXISTS (SELECT 1 FROM applications WHERE id = ? AND rev = ?)";
@@ -152,7 +203,7 @@ async function transition(
         opts.event.to,
         opts.event.type,
         app.id,
-        JSON.stringify(eventPayload(app, opts.event.to, to, opts.note)),
+        JSON.stringify(eventPayload(app, opts.event.to, to, opts.note, set.reject_reason)),
         now,
         app.id,
         rev,
@@ -174,6 +225,7 @@ async function insertApplication(
     initiatedBy: Role;
     status: ApplicationStatus;
     customResume?: unknown;
+    answers?: Answer[];
     invitation?: Invitation;
     note?: string;
     event: { accountId: string; to: Role; type: string; payload: unknown };
@@ -186,8 +238,8 @@ async function insertApplication(
       db
         .prepare(
           `INSERT INTO applications (id, job_id, candidate_id, initiated_by, status, custom_resume, invitation,
-             rev, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`,
+             rev, created_at, updated_at, answers)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)`,
         )
         .bind(
           id,
@@ -199,6 +251,7 @@ async function insertApplication(
           fields.invitation ? JSON.stringify(fields.invitation) : null,
           randomHex(8),
           now,
+          fields.answers?.length ? JSON.stringify(fields.answers) : null,
         ),
       db
         .prepare(
@@ -265,6 +318,8 @@ function summary(app: AppRow) {
     candidate_name: app.candidate_name,
     invitation: parseJson<Invitation | null>(app.invitation, null),
     chosen_slot: app.chosen_slot,
+    offer: parseJson<unknown>(app.offer, null),
+    reject_reason: app.reject_reason,
     created_at: app.created_at,
     updated_at: app.updated_at,
   };
@@ -277,8 +332,15 @@ async function detail(ctx: Ctx, app: AppRow, side: Role) {
     )
     .bind(app.id)
     .all();
-  const base = { ...summary(app), closed_by: app.closed_by, ended_at: app.ended_at, viewing_as: side, logs };
-  const accepted = app.status === "accepted";
+  const base = {
+    ...summary(app),
+    answers: parseJson<Answer[]>(app.answers, []),
+    closed_by: app.closed_by,
+    ended_at: app.ended_at,
+    viewing_as: side,
+    logs,
+  };
+  const accepted = CONTACT_STATUSES.includes(app.status);
   if (side === "candidate") {
     return {
       ...base,
@@ -318,7 +380,7 @@ export const applicationOps = [
     name: "application_create",
     title: "投递岗位",
     description:
-      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。每天最多投 20 次。",
+      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。岗位有筛选问题（job_get 返回的 questions）时，必须在 answers 里按顺序逐个回答，答案要来自用户，不要自己编。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。每天最多投 20 次。",
     method: "POST",
     path: "/applications",
     scopes: ["candidate:apply"],
@@ -344,6 +406,7 @@ export const applicationOps = [
         const retryAt = new Date(new Date(last.ended_at ?? 0).getTime() + REAPPLY_DAYS * 86400000);
         if (retryAt.getTime() > Date.now()) throw duplicate(last, retryAt.toISOString());
       }
+      const answers = checkAnswers(parseJson<Question[]>(job.questions, []), input.answers);
       const limit = limits(ctx.env).applyPerDay;
       if ((await appliedToday(ctx.db, me)) >= limit) throw quotaExceeded("今天的投递次数", limit, beijingDay().end);
 
@@ -353,6 +416,7 @@ export const applicationOps = [
         initiatedBy: "candidate",
         status: "applied",
         customResume: input.custom_resume,
+        answers,
         note: input.note,
         event: {
           accountId: company.owner_account_id,
@@ -415,7 +479,7 @@ export const applicationOps = [
     name: "application_get",
     title: "查看投递详情",
     description:
-      "查看一条投递的全部信息：状态、邀约内容、每一步的备注记录。招聘者还能看到求职者的简历和这次投递附带的 custom_resume；招聘者第一次查看时，投递会从“已投递”变成“已查看”，求职者会收到通知。状态变成“已接受”后，contact 字段里才有对方的联系方式。",
+      "查看一条投递的全部信息：状态、邀约内容、筛选问题的回答、录用内容、每一步的备注记录。招聘者还能看到求职者的简历和这次投递附带的 custom_resume；招聘者第一次查看时，投递会从“已投递”变成“已查看”，求职者会收到通知。状态是“已接受”“已发录用”“已录用”时，contact 字段里才有对方的联系方式。",
     method: "GET",
     path: "/applications/:application_id",
     scopes: ["candidate:read", "recruiter:read"],
@@ -443,7 +507,7 @@ export const applicationOps = [
   defineOp({
     name: "application_withdraw",
     title: "撤回投递",
-    description: "求职者撤回一条还没结束的投递，或放弃一条还没回应的邀约。撤回后不能恢复，7 天内也不能再投同一个岗位。",
+    description: "求职者撤回一条还没结束的投递：可以是还没回音的投递、还没回应的邀约，也可以是已经约好的面试。撤回后不能恢复，7 天内也不能再投同一个岗位。",
     method: "POST",
     path: "/applications/:application_id/withdraw",
     scopes: ["candidate:apply"],
@@ -579,19 +643,21 @@ export const applicationOps = [
   defineOp({
     name: "application_reject",
     title: "拒绝投递",
-    description: "招聘者拒绝一条投递，或取消一条对方还没回应的邀约。拒绝后不能恢复，求职者会收到通知。",
+    description:
+      "招聘者拒绝一条还没结束的投递：可以是筛简历时不合适、取消邀约、面试没通过，或撤回录用。必须在 reason 里选一个原因，求职者能看到。拒绝后不能恢复。",
     method: "POST",
     path: "/applications/:application_id/reject",
     scopes: ["recruiter:invite"],
     readOnly: false,
     destructive: true,
-    input: ApplicationActionInput,
+    input: ApplicationRejectInput,
     handler: async (ctx, input) => {
       const app = await loadApp(ctx.db, input.application_id);
       mustOwn(ctx, app, "recruiter");
       await transition(ctx.db, app, ACTIVE_STATUSES, "rejected", {
         actor: "recruiter",
         note: input.note,
+        set: { reject_reason: input.reason },
         event: { to: "candidate", type: "application.rejected" },
       });
       return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
@@ -599,10 +665,65 @@ export const applicationOps = [
   }),
 
   defineOp({
+    name: "offer_create",
+    title: "发出录用",
+    description:
+      "招聘者在面试之后向求职者发出录用。只有“已接受”邀约的投递可以发。可以写明入职日期、薪资和答复期限。面试没通过请用 application_reject，reason 选 interview_failed。发出前先让用户确认。",
+    method: "POST",
+    path: "/applications/:application_id/offer",
+    scopes: ["recruiter:invite"],
+    readOnly: false,
+    input: OfferCreateInput,
+    handler: async (ctx, input) => {
+      if ((input.salary == null) !== (input.salary_unit == null)) {
+        throw invalid([{ field: "salary_unit", message: "salary 和 salary_unit 必须一起传。" }]);
+      }
+      const app = await loadApp(ctx.db, input.application_id);
+      mustOwn(ctx, app, "recruiter");
+      const offer = {
+        start_date: input.start_date ?? null,
+        salary: input.salary ?? null,
+        salary_unit: input.salary_unit ?? null,
+        reply_by: input.reply_by ?? null,
+      };
+      await transition(ctx.db, app, ["accepted"], "offered", {
+        actor: "recruiter",
+        note: input.note,
+        set: { offer: JSON.stringify(offer) },
+        event: { to: "candidate", type: "offer.created" },
+      });
+      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
+    },
+  }),
+
+  defineOp({
+    name: "offer_respond",
+    title: "回应录用",
+    description:
+      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。这一步不能撤销，回应前先让用户确认。",
+    method: "POST",
+    path: "/applications/:application_id/offer/respond",
+    scopes: ["candidate:apply"],
+    readOnly: false,
+    destructive: true,
+    input: OfferRespondInput,
+    handler: async (ctx, input) => {
+      const app = await loadApp(ctx.db, input.application_id);
+      mustOwn(ctx, app, "candidate");
+      await transition(ctx.db, app, ["offered"], input.accept ? "hired" : "rejected", {
+        actor: "candidate",
+        note: input.note,
+        event: { to: "recruiter", type: input.accept ? "offer.accepted" : "application.rejected" },
+      });
+      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
+    },
+  }),
+
+  defineOp({
     name: "events_poll",
     title: "拉取新事件",
     description:
-      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约被接受、被拒绝、被撤回、岗位关闭。传 after（上次返回的 next_after）只取之后的事件。事件里只有摘要，详情用 application_get 取。有未结束的投递时每 10 分钟拉一次就够，每分钟最多 6 次。",
+      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约被接受、收到录用、录用被接受、被拒绝、被撤回、岗位关闭，以及订阅命中的新岗位（job.matched，没有 application_id，用 job_get 读详情）。传 after（上次返回的 next_after）只取之后的事件。事件里只有摘要，投递详情用 application_get 取。有未结束的投递或有订阅时每 10 分钟拉一次就够，每分钟最多 6 次。",
     method: "GET",
     path: "/events",
     scopes: [],
@@ -614,6 +735,7 @@ export const applicationOps = [
         [...ctx.auth.scopes].some((s) => s.startsWith(`${role}:`)),
       );
       if (!audiences.length) return { events: [], next_after: input.after ?? 0, has_more: false };
+      if (audiences.includes("candidate")) await deliverMatches(ctx);
       const limit = input.limit ?? 50;
       const { results } = await ctx.db
         .prepare(
@@ -622,7 +744,7 @@ export const applicationOps = [
            ORDER BY seq LIMIT ?`,
         )
         .bind(ctx.auth.accountId, input.after ?? 0, ...audiences, limit + 1)
-        .all<{ seq: number; audience: string; type: string; application_id: string; payload: string; created_at: string }>();
+        .all<{ seq: number; audience: string; type: string; application_id: string | null; payload: string; created_at: string }>();
       const page = results.slice(0, limit);
       return {
         events: page.map((e) => ({
@@ -679,7 +801,7 @@ export const applicationOps = [
 export async function resumePdfForApplication(ctx: Ctx, applicationId: string) {
   const app = await loadApp(ctx.db, applicationId);
   mustOwn(ctx, app, "recruiter");
-  if (app.status !== "accepted") {
+  if (!CONTACT_STATUSES.includes(app.status)) {
     throw new HireError("invalid_transition", "只有对方接受邀约之后，才能下载 PDF 简历。", {
       current_status: app.status,
     });

@@ -58,7 +58,8 @@ describe("状态和限制", () => {
     expect(again.data.error.details.retry_after).toBeTruthy();
     const invite = await api("POST", "/invitations", hr, { application_id: appId, mode: "online", slots: [future(1)] });
     expect(invite.data.error).toMatchObject({ code: "invalid_transition", details: { current_status: "withdrawn" } });
-    expect((await api("POST", `/applications/${appId}/reject`, hr, {})).status).toBe(409);
+    expect((await api("POST", `/applications/${appId}/reject`, hr, {})).status).toBe(422);
+    expect((await api("POST", `/applications/${appId}/reject`, hr, { reason: "other" })).status).toBe(409);
   });
 
   it("别人的投递看不到，也改不了", async () => {
@@ -66,7 +67,7 @@ describe("状态和限制", () => {
     const appId = (await api("POST", "/applications", seeker, { job_id: job.id })).data.application.id;
     const stranger = await login(unique("x"));
     expect((await api("GET", `/applications/${appId}`, stranger)).status).toBe(404);
-    expect((await api("POST", `/applications/${appId}/reject`, stranger, {})).status).toBe(404);
+    expect((await api("POST", `/applications/${appId}/reject`, stranger, { reason: "other" })).status).toBe(404);
     expect((await api("POST", `/applications/${appId}/withdraw`, stranger, {})).status).toBe(404);
   });
 

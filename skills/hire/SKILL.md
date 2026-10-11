@@ -59,14 +59,17 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 **找岗位。**
 
 1. 用 `jobs_search`。先用硬条件：`city`、`recruit_type`、`days_per_week_max`、`grad_year`、`degree`。结果太多再加 `category`、`skills` 或 `q`。
-2. 服务端不打分。对看起来相关的岗位逐个调 `job_get` 读职责和要求，对照用户的资料自己判断。
-3. 把合适的岗位列给用户：公司、岗位、城市、每周天数、薪资、为什么合适、哪里不匹配。由用户决定投哪些。
+2. 结果里的 `recruiter_active_at` 是招聘者最近活跃时间。很久没活跃的岗位排到后面，或用 `active_within_days` 直接滤掉。
+3. 服务端不打分。对看起来相关的岗位逐个调 `job_get` 读职责和要求，对照用户的资料自己判断。`recruiter.response_rate` 是这家公司处理投递的比例，偏低时提醒用户。
+4. 把合适的岗位列给用户：公司、岗位、城市、每周天数、薪资、为什么合适、哪里不匹配。由用户决定投哪些。
+5. 用户想持续关注某类岗位时，用 `subscription_create` 保存搜索条件。之后有新岗位符合，`events_poll` 里会出现 `job.matched`，用 `job_get` 读详情再告诉用户。最多 5 个订阅。
 
 **投递。**
 
 1. 用户选定后，可以针对这个岗位写一份 `custom_resume`：调整简介和项目描述的侧重。只能用资料里已有的事实，不能新增经历。
-2. 把 `custom_resume` 和 `note` 给用户看，确认后再调 `application_create`。
-3. 每天最多投 20 次。同一个岗位被拒绝或撤回后 7 天内不能再投。
+2. 岗位的 `questions` 不为空时，把问题逐个问用户，按顺序填进 `answers`。单选题只能填 `options` 里的一项。不要替用户回答。
+3. 把 `custom_resume`、`answers` 和 `note` 给用户看，确认后再调 `application_create`。
+4. 每天最多投 20 次。同一个岗位被拒绝或撤回后 7 天内不能再投。
 
 **跟进。**
 
@@ -74,6 +77,8 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 2. 收到 `invitation.created` 时，调 `application_get` 读邀约：面试方式、可选时间、备注。把它们告诉用户。
 3. 用户决定后调 `invitation_respond`。接受时 `slot` 必须是邀约给出的时间之一。接受后对方会看到手机和邮箱，这一步不能撤销。
 4. 接受后再调 `application_get`，`contact` 里有公司的联系邮箱。
+5. 收到 `offer.created` 时，调 `application_get` 读 `offer`：入职日期、薪资、答复期限。告诉用户，由用户决定后调 `offer_respond`。
+6. 收到 `application.rejected` 时，事件里的 `reason` 是对方选的原因，转告用户。
 
 ## 替招聘者做事
 
@@ -87,15 +92,24 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 2. 实习岗位（`intern_daily`、`intern_grad`）必须填 `days_per_week` 和 `min_months`。其他类型不要传这两项。
 3. 薪资不面议时，`salary_min`、`salary_max`、`salary_unit` 三项都要填。实习一般用 `per_day`，全职用 `k_per_month`。
 4. 用户没说的要求不要自己编，缺必填项就问。
-5. 发布前把整理好的内容给用户确认。
+5. 用户想先筛一遍时，在 `questions` 里放最多 3 个筛选问题。能列出选项的用单选题，方便对比。
+6. 发布前把整理好的内容给用户确认。
 
 **看投递。**
 
 1. `events_poll` 里出现 `application.created` 时，用 `job_applications_list` 列出这个岗位的投递。
-2. 调 `application_get` 读简历。第一次调用会把投递标成“已查看”，求职者会收到通知。
+2. 调 `application_get` 读简历和 `answers`（筛选问题的回答）。第一次调用会把投递标成“已查看”，求职者会收到通知。
 3. 对照岗位要求给用户一个判断：符合哪几条，缺哪几条。由用户决定下一步。
 4. 邀约用 `invitation_create`，传 `application_id`、面试方式和 1 到 5 个可选时间。时间要带时区，如 `2026-10-20T14:00:00+08:00`。
-5. 不合适用 `application_reject`，备注里写一句原因。
+5. 不合适用 `application_reject`，`reason` 必填，从枚举里选最接近的一个，备注里可以再写一句。
+
+**面试之后。**
+
+1. 问用户面试结果。通过用 `offer_create`，可以写入职日期、薪资和答复期限。
+2. 没通过用 `application_reject`，`reason` 选 `interview_failed`。
+3. 对方接受录用时会收到 `offer.accepted`。
+
+**看数据。** `job_stats` 返回一个岗位的漏斗：详情被读了多少次、收到多少投递、处理了多少、多少走到邀约、接受和录用，以及拒绝原因的分布。用户问“这个岗位招得怎么样”时用它。
 
 **主动找人。**
 
@@ -103,17 +117,17 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 2. 合适的用 `invitation_create`，传 `job_id` 和 `candidate_id`。每个岗位每天最多主动邀约 20 人。
 3. 对方接受后，`application_get` 的 `contact` 里有手机、邮箱和 PDF 的下载路径。
 
-**岗位招满了**，用 `job_close`。它会结束这个岗位下所有还没结束的投递，不能重新打开。只是暂时不招，用 `job_update` 把 `status` 改成 `paused`。
+**岗位招满了**，用 `job_close`。它会结束这个岗位下还没约上面试的投递，不能重新打开。已经约好面试和已发录用的投递不受影响。只是暂时不招，用 `job_update` 把 `status` 改成 `paused`。
 
 ## 轮询
 
-- 有未结束的投递（已投递、已查看、已邀约）时，每 10 分钟调一次 `events_poll`。没有就不用轮询。
+- 有未结束的投递（已投递、已查看、已邀约、已接受、已发录用）或有订阅时，每 10 分钟调一次 `events_poll`。都没有就不用轮询。
 - 每分钟最多 6 次。
-- 事件里只有摘要，详情用 `application_get` 取。
+- 事件里只有摘要，投递详情用 `application_get` 取。`job.matched` 没有投递编号，用 `job_get` 取岗位详情。
 
 ## 规矩
 
-- **先确认再执行。** 投递、回应邀约、发邀约、拒绝、撤回、关闭岗位都会被对方看到，而且不能撤销。执行前把要发出的内容给用户看。
+- **先确认再执行。** 投递、回应邀约、发邀约、发录用、回应录用、拒绝、撤回、关闭岗位都会被对方看到，而且不能撤销。执行前把要发出的内容给用户看。
 - **只写事实。** 简历和岗位里只写用户确认过的内容。
 - **读错误信息。** 出错时返回 `error.code` 和 `error.message`。`validation_failed` 的 `details.fields` 列出了每个出错的字段，改正后重试。
 - **不要硬试。** `quota_exceeded` 表示到上限了，等到 `reset_at` 再说。`duplicate_application`、`invalid_transition`、`forbidden_scope` 重试也不会成功，把情况告诉用户。

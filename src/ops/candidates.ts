@@ -37,6 +37,7 @@ export interface CandidateRow {
   pdf_key: string | null;
   pdf_name: string | null;
   pdf_size: number | null;
+  active_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -65,6 +66,7 @@ export function candidatePublic(row: CandidateRow) {
     projects: parseJson<unknown[]>(row.projects, []),
     links: parseJson<string[]>(row.links, []),
     expectation: parseJson<ExpectationData>(row.expectation, {}),
+    active_at: row.active_at,
     updated_at: row.updated_at,
   };
 }
@@ -85,6 +87,7 @@ function candidateSummary(row: CandidateRow) {
     city: row.city,
     skills: parseJson<string[]>(row.skills, []),
     expectation,
+    active_at: row.active_at,
     updated_at: row.updated_at,
   };
 }
@@ -293,7 +296,7 @@ export const candidateOps = [
     name: "candidates_search",
     title: "搜索求职者",
     description:
-      "招聘者按条件搜索公开了简历的求职者，返回摘要列表，按更新时间从新到旧排列。服务端只做条件过滤，不打分。结果里没有手机和邮箱，联系方式要等对方接受邀约后才能看到。",
+      "招聘者按条件搜索公开了简历的求职者，返回摘要列表，按更新时间从新到旧排列。服务端只做条件过滤，不打分。每条结果带 active_at（最近活跃时间），active_within_days 可以只看近期活跃的人。结果里没有手机和邮箱，联系方式要等对方接受邀约后才能看到。",
     method: "GET",
     path: "/candidates",
     scopes: ["recruiter:read"],
@@ -329,6 +332,10 @@ export const candidateOps = [
           `EXISTS (SELECT 1 FROM candidate_skills s WHERE s.account_id = c.account_id AND s.skill IN (${placeholders(input.skills.length)}))`,
         );
         where.params.push(...input.skills);
+      }
+      if (input.active_within_days !== undefined) {
+        where.clauses.push("c.active_at >= ?");
+        where.params.push(new Date(Date.now() - input.active_within_days * 86400000).toISOString());
       }
       addKeyword(where, input.q, {
         fts: "candidates_fts",

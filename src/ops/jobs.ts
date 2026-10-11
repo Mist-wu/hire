@@ -8,6 +8,7 @@ import {
   JobCloseInput,
   JobCreateInput,
   JobFields,
+  type JobFilters,
   JobGetInput,
   JobUpdateInput,
   JobsSearchInput,
@@ -15,7 +16,7 @@ import {
   parseInput,
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
-import { ACTIVE_STATUSES, CATEGORY_NAMES, DEGREE_RANK, type Degree } from "../taxonomy";
+import { CATEGORY_NAMES, DEGREE_RANK, PENDING_STATUSES, type Degree } from "../taxonomy";
 import { newId, nowIso, parseJson, randomHex } from "../util";
 
 export interface CompanyRow {
@@ -29,6 +30,7 @@ export interface CompanyRow {
   intro: string | null;
   verified: number;
   contact_email: string | null;
+  active_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -62,6 +64,8 @@ export interface JobRow {
   status: string;
   source_url: string | null;
   custom_fields: string;
+  questions: string;
+  detail_views: number;
   created_at: string;
   updated_at: string;
 }
@@ -107,6 +111,7 @@ function jobFieldsFromRow(row: JobRow): JobFields {
     deadline: row.deadline,
     source_url: row.source_url,
     custom_fields: parseJson<Record<string, string>>(row.custom_fields, {}),
+    questions: parseJson<NonNullable<JobFields["questions"]>>(row.questions, []),
   };
 }
 
@@ -122,7 +127,7 @@ export function jobToApi(row: JobRow, company: CompanyRow) {
   };
 }
 
-function jobSummary(row: JobRow & { company_name: string }) {
+function jobSummary(row: JobRow & { company_name: string; recruiter_active_at: string | null }) {
   return {
     id: row.id,
     status: row.status,
@@ -143,6 +148,8 @@ function jobSummary(row: JobRow & { company_name: string }) {
     days_per_week: row.days_per_week,
     min_months: row.min_months,
     skills: parseJson<string[]>(row.skills, []),
+    question_count: parseJson<unknown[]>(row.questions, []).length,
+    recruiter_active_at: row.recruiter_active_at,
     updated_at: row.updated_at,
   };
 }
@@ -199,9 +206,9 @@ function jobWriteStatements(
         `INSERT INTO jobs (id, company_id, title, recruit_type, category, category_l1, cities, remote, teams,
            experience, degree, degree_rank, grad_years, salary_min, salary_max, salary_unit, salary_months,
            salary_negotiable, days_per_week, min_months, convertible, duties, requirements, bonus, skills,
-           headcount, deadline, status, source_url, custom_fields, search_text, created_at, updated_at)
+           headcount, deadline, status, source_url, custom_fields, search_text, created_at, updated_at, questions)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-           ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+           ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT (id) DO UPDATE SET
            title = excluded.title, recruit_type = excluded.recruit_type, category = excluded.category,
            category_l1 = excluded.category_l1, cities = excluded.cities, remote = excluded.remote,
@@ -214,7 +221,8 @@ function jobWriteStatements(
            requirements = excluded.requirements, bonus = excluded.bonus, skills = excluded.skills,
            headcount = excluded.headcount, deadline = excluded.deadline, status = excluded.status,
            source_url = excluded.source_url, custom_fields = excluded.custom_fields,
-           search_text = excluded.search_text, updated_at = excluded.updated_at`,
+           search_text = excluded.search_text, updated_at = excluded.updated_at,
+           questions = excluded.questions`,
       )
       .bind(
         id,
@@ -250,6 +258,7 @@ function jobWriteStatements(
         searchText,
         createdAt,
         now,
+        JSON.stringify(f.questions ?? []),
       ),
     db.prepare("DELETE FROM job_cities WHERE job_id = ?").bind(id),
     db.prepare("DELETE FROM job_skills WHERE job_id = ?").bind(id),
@@ -269,9 +278,89 @@ function jobWriteStatements(
   return stmts;
 }
 
+const round1 = (n: number | null) => (n == null ? null : Math.round(n * 10) / 10);
+
+/** 招聘者的活跃度：最近活跃时间，以及近 90 天收到的投递里处理过多少。 */
+async function recruiterActivity(db: D1Database, company: CompanyRow) {
+  const since = new Date(Date.now() - 90 * 86400000).toISOString();
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS total, COUNT(a.responded_at) AS responded,
+              AVG((julianday(a.responded_at) - julianday(a.created_at)) * 24) AS avg_hours
+       FROM applications a JOIN jobs j ON j.id = a.job_id
+       WHERE j.company_id = ? AND a.initiated_by = 'candidate' AND a.created_at >= ?`,
+    )
+    .bind(company.id, since)
+    .first<{ total: number; responded: number; avg_hours: number | null }>();
+  const total = row?.total ?? 0;
+  return {
+    active_at: company.active_at,
+    applications_90d: total,
+    response_rate: total ? Math.round(((row?.responded ?? 0) / total) * 100) / 100 : null,
+    avg_response_hours: round1(row?.avg_hours ?? null),
+  };
+}
+
 async function getJob(ctx: Ctx, jobId: string) {
   const { job, company } = await loadJob(ctx.db, jobId);
-  return jobToApi(job, company);
+  return { ...jobToApi(job, company), recruiter: await recruiterActivity(ctx.db, company) };
+}
+
+export function checkSalaryPair(input: JobFilters): void {
+  if ((input.salary_min == null) !== (input.salary_unit == null)) {
+    throw invalid([{ field: "salary_unit", message: "salary_min 和 salary_unit 必须一起传。" }]);
+  }
+}
+
+/** 把搜索条件拼进 where。表别名：jobs 是 j，companies 是 c。 */
+export function addJobFilters(where: Where, input: JobFilters): void {
+  const eq = (col: string, value: unknown) => {
+    if (value === undefined) return;
+    where.clauses.push(`${col} = ?`);
+    where.params.push(value);
+  };
+  eq("j.recruit_type", input.recruit_type);
+  eq("j.company_id", input.company_id);
+  if (input.category) eq(input.category.includes(".") ? "j.category" : "j.category_l1", input.category);
+  if (input.remote !== undefined) eq("j.remote", input.remote ? 1 : 0);
+  if (input.city) {
+    where.clauses.push("EXISTS (SELECT 1 FROM job_cities jc WHERE jc.job_id = j.id AND jc.city = ?)");
+    where.params.push(input.city);
+  }
+  if (input.degree) {
+    where.clauses.push("j.degree_rank <= ?");
+    where.params.push(DEGREE_RANK[input.degree]);
+  }
+  if (input.grad_year !== undefined) {
+    where.clauses.push(
+      `(NOT EXISTS (SELECT 1 FROM job_grad_years g WHERE g.job_id = j.id)
+        OR EXISTS (SELECT 1 FROM job_grad_years g WHERE g.job_id = j.id AND g.year = ?))`,
+    );
+    where.params.push(input.grad_year);
+  }
+  if (input.days_per_week_max !== undefined) {
+    where.clauses.push("j.days_per_week <= ?");
+    where.params.push(input.days_per_week_max);
+  }
+  if (input.min_months_max !== undefined) {
+    where.clauses.push("j.min_months <= ?");
+    where.params.push(input.min_months_max);
+  }
+  if (input.salary_min !== undefined) {
+    where.clauses.push("j.salary_unit = ? AND j.salary_max >= ?");
+    where.params.push(input.salary_unit, input.salary_min);
+  }
+  if (input.skills?.length) {
+    where.clauses.push(
+      `EXISTS (SELECT 1 FROM job_skills s WHERE s.job_id = j.id AND s.skill IN (${placeholders(input.skills.length)}))`,
+    );
+    where.params.push(...input.skills);
+  }
+  if (input.active_within_days !== undefined) {
+    where.clauses.push("c.active_at >= ?");
+    where.params.push(new Date(Date.now() - input.active_within_days * 86400000).toISOString());
+  }
+  addKeyword(where, input.q, { fts: "jobs_fts", ftsKey: "job_id", idCol: "j.id", textCol: "j.search_text" });
 }
 
 export const jobOps = [
@@ -425,7 +514,7 @@ export const jobOps = [
     name: "job_close",
     title: "关闭岗位",
     description:
-      "招聘者关闭自己的岗位。关闭后不能再投递，也不能重新打开。这个岗位下所有还没结束的投递会变成“已关闭”，对应的求职者会收到事件。",
+      "招聘者关闭自己的岗位。关闭后不能再投递，也不能重新打开。这个岗位下还没约上面试的投递（已投递、已查看、已邀约）会变成“已关闭”，对应的求职者会收到事件。已接受邀约和已发录用的投递不受影响。",
     method: "POST",
     path: "/jobs/:job_id/close",
     scopes: ["recruiter:write"],
@@ -440,9 +529,9 @@ export const jobOps = [
       const { results: active } = await ctx.db
         .prepare(
           `SELECT id, candidate_id, status FROM applications
-           WHERE job_id = ? AND status IN (${placeholders(ACTIVE_STATUSES.length)})`,
+           WHERE job_id = ? AND status IN (${placeholders(PENDING_STATUSES.length)})`,
         )
-        .bind(job.id, ...ACTIVE_STATUSES)
+        .bind(job.id, ...PENDING_STATUSES)
         .all<{ id: string; candidate_id: string; status: string }>();
 
       const stmts: D1PreparedStatement[] = [
@@ -493,31 +582,103 @@ export const jobOps = [
   }),
 
   defineOp({
+    name: "job_stats",
+    title: "查看岗位数据",
+    description:
+      "招聘者查看自己一个岗位的漏斗数据：详情被读取的次数（不去重）、收到的投递数、处理过多少、有多少走到邀约、接受、录用，各状态现在各有几条，以及拒绝原因的分布。",
+    method: "GET",
+    path: "/jobs/:job_id/stats",
+    scopes: ["recruiter:read"],
+    readOnly: true,
+    input: JobGetInput,
+    handler: async (ctx, input) => {
+      const { job } = await loadJob(ctx.db, input.job_id, ctx.auth.accountId);
+      const [totals, current, reached, reasons] = await ctx.db.batch<Record<string, number | string | null>>([
+        ctx.db
+          .prepare(
+            `SELECT COUNT(*) AS total, COALESCE(SUM(initiated_by = 'candidate'), 0) AS by_candidate,
+                    COUNT(CASE WHEN initiated_by = 'candidate' THEN responded_at END) AS responded,
+                    AVG((julianday(responded_at) - julianday(created_at)) * 24) AS avg_hours
+             FROM applications WHERE job_id = ?`,
+          )
+          .bind(job.id),
+        ctx.db.prepare("SELECT status AS k, COUNT(*) AS n FROM applications WHERE job_id = ? GROUP BY status").bind(job.id),
+        ctx.db
+          .prepare(
+            `SELECT l.to_status AS k, COUNT(DISTINCT l.application_id) AS n
+             FROM application_logs l JOIN applications a ON a.id = l.application_id
+             WHERE a.job_id = ? GROUP BY l.to_status`,
+          )
+          .bind(job.id),
+        ctx.db
+          .prepare(
+            `SELECT reject_reason AS k, COUNT(*) AS n FROM applications
+             WHERE job_id = ? AND reject_reason IS NOT NULL GROUP BY reject_reason`,
+          )
+          .bind(job.id),
+      ]);
+      const map = (rows: Record<string, number | string | null>[] | undefined) =>
+        Object.fromEntries((rows ?? []).map((r) => [String(r.k), Number(r.n)]));
+      const t = totals?.results[0] ?? {};
+      const ever = map(reached?.results);
+      const total = Number(t.total ?? 0);
+      const byCandidate = Number(t.by_candidate ?? 0);
+      return {
+        job_id: job.id,
+        title: job.title,
+        status: job.status,
+        detail_views: job.detail_views,
+        applications: { total, by_candidate: byCandidate, by_recruiter: total - byCandidate },
+        funnel: {
+          applied: byCandidate,
+          responded: Number(t.responded ?? 0),
+          invited: ever.invited ?? 0,
+          accepted: ever.accepted ?? 0,
+          offered: ever.offered ?? 0,
+          hired: ever.hired ?? 0,
+        },
+        avg_response_hours: round1(t.avg_hours == null ? null : Number(t.avg_hours)),
+        current: map(current?.results),
+        reject_reasons: map(reasons?.results),
+      };
+    },
+  }),
+
+  defineOp({
     name: "job_get",
     title: "查看岗位详情",
-    description: "查看一个岗位的全部信息，包括公司资料、职责、要求和薪资。搜索结果只有摘要，判断是否合适前先读详情。",
+    description:
+      "查看一个岗位的全部信息，包括公司资料、职责、要求、薪资和筛选问题。recruiter 字段是招聘者的活跃度：最近活跃时间、近 90 天收到的投递数、处理过的比例和平均处理时长。搜索结果只有摘要，判断是否合适前先读详情。",
     method: "GET",
     path: "/jobs/:job_id",
     scopes: ["candidate:read", "recruiter:read"],
     readOnly: true,
     input: JobGetInput,
-    handler: async (ctx, input) => ({ job: await getJob(ctx, input.job_id) }),
+    handler: async (ctx, input) => {
+      const job = await getJob(ctx, input.job_id);
+      const mine = await ctx.db
+        .prepare("SELECT 1 FROM companies WHERE id = ? AND owner_account_id = ?")
+        .bind(job.company.id, ctx.auth.accountId)
+        .first();
+      if (!mine) {
+        await ctx.db.prepare("UPDATE jobs SET detail_views = detail_views + 1 WHERE id = ?").bind(job.id).run();
+      }
+      return { job };
+    },
   }),
 
   defineOp({
     name: "jobs_search",
     title: "搜索岗位",
     description:
-      "按条件搜索开放中的岗位，返回摘要列表，按更新时间从新到旧排列。服务端只做条件过滤，不打分；合不合适要读详情后自己判断。先用城市、招聘类型、每周天数这些硬条件缩小范围，再用关键词。招聘者传 mine=true 可以列出自己名下所有状态的岗位。",
+      "按条件搜索开放中的岗位，返回摘要列表，按更新时间从新到旧排列。服务端只做条件过滤，不打分；合不合适要读详情后自己判断。先用城市、招聘类型、每周天数这些硬条件缩小范围，再用关键词。每条结果带 recruiter_active_at（招聘者最近活跃时间）和 question_count（筛选问题数）；active_within_days 可以滤掉没人管的岗位。招聘者传 mine=true 可以列出自己名下所有状态的岗位。",
     method: "GET",
     path: "/jobs",
     scopes: ["candidate:read", "recruiter:read"],
     readOnly: true,
     input: JobsSearchInput,
     handler: async (ctx, input) => {
-      if ((input.salary_min == null) !== (input.salary_unit == null)) {
-        throw invalid([{ field: "salary_unit", message: "salary_min 和 salary_unit 必须一起传。" }]);
-      }
+      checkSalaryPair(input);
       await hitRate(ctx.db, `search:${ctx.auth.accountId}`, limits(ctx.env).searchPerMin, "每分钟搜索次数");
 
       const where: Where = { clauses: [], params: [] };
@@ -532,60 +693,18 @@ export const jobOps = [
       } else {
         where.clauses.push("j.status = 'open'");
       }
-      const eq = (col: string, value: unknown) => {
-        if (value === undefined) return;
-        where.clauses.push(`${col} = ?`);
-        where.params.push(value);
-      };
-      eq("j.recruit_type", input.recruit_type);
-      eq("j.company_id", input.company_id);
-      if (input.category) eq(input.category.includes(".") ? "j.category" : "j.category_l1", input.category);
-      if (input.remote !== undefined) eq("j.remote", input.remote ? 1 : 0);
-      if (input.city) {
-        where.clauses.push("EXISTS (SELECT 1 FROM job_cities jc WHERE jc.job_id = j.id AND jc.city = ?)");
-        where.params.push(input.city);
-      }
-      if (input.degree) {
-        where.clauses.push("j.degree_rank <= ?");
-        where.params.push(DEGREE_RANK[input.degree]);
-      }
-      if (input.grad_year !== undefined) {
-        where.clauses.push(
-          `(NOT EXISTS (SELECT 1 FROM job_grad_years g WHERE g.job_id = j.id)
-            OR EXISTS (SELECT 1 FROM job_grad_years g WHERE g.job_id = j.id AND g.year = ?))`,
-        );
-        where.params.push(input.grad_year);
-      }
-      if (input.days_per_week_max !== undefined) {
-        where.clauses.push("j.days_per_week <= ?");
-        where.params.push(input.days_per_week_max);
-      }
-      if (input.min_months_max !== undefined) {
-        where.clauses.push("j.min_months <= ?");
-        where.params.push(input.min_months_max);
-      }
-      if (input.salary_min !== undefined) {
-        where.clauses.push("j.salary_unit = ? AND j.salary_max >= ?");
-        where.params.push(input.salary_unit, input.salary_min);
-      }
-      if (input.skills?.length) {
-        where.clauses.push(
-          `EXISTS (SELECT 1 FROM job_skills s WHERE s.job_id = j.id AND s.skill IN (${placeholders(input.skills.length)}))`,
-        );
-        where.params.push(...input.skills);
-      }
-      addKeyword(where, input.q, { fts: "jobs_fts", ftsKey: "job_id", idCol: "j.id", textCol: "j.search_text" });
+      addJobFilters(where, input);
       addCursor(where, input.cursor, "j.updated_at", "j.id");
 
       const limit = input.limit ?? 20;
       const { results } = await ctx.db
         .prepare(
-          `SELECT j.*, c.name AS company_name FROM jobs j JOIN companies c ON c.id = j.company_id
+          `SELECT j.*, c.name AS company_name, c.active_at AS recruiter_active_at FROM jobs j JOIN companies c ON c.id = j.company_id
            WHERE ${where.clauses.join(" AND ")}
            ORDER BY j.updated_at DESC, j.id DESC LIMIT ?`,
         )
         .bind(...where.params, limit + 1)
-        .all<JobRow & { company_name: string }>();
+        .all<JobRow & { company_name: string; recruiter_active_at: string | null }>();
       const { page, next_cursor } = paginate(results, limit, (row) => [row.updated_at, row.id]);
       return { jobs: page.map(jobSummary), next_cursor };
     },
