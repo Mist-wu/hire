@@ -13,6 +13,15 @@ import { nowIso } from "./util";
 
 const app = new Hono<{ Bindings: Env }>();
 
+// 浏览器直接打开 JSON 时，没有 charset 会按系统的旧编码猜，中文变成乱码。
+app.use("*", async (c, next) => {
+  await next();
+  if (c.res.headers.get("Content-Type")?.toLowerCase() === "application/json") {
+    c.res = new Response(c.res.body, c.res);
+    c.res.headers.set("Content-Type", "application/json; charset=utf-8");
+  }
+});
+
 const open = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "PUT", "PATCH", "OPTIONS"],
