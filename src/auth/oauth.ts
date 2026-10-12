@@ -342,7 +342,7 @@ oauth.get("/oauth/github/callback", async (c) => {
 <input type="hidden" name="request_id" value="${escapeHtml(request.id)}">
 <input type="hidden" name="csrf" value="${escapeHtml(request.csrf)}">
 <h1>${clientName} 请求访问你的账号</h1>
-<p class="muted">${escapeHtml(user.login)} · 授权后跳转到 ${escapeHtml(host)}${roles.length > 1 ? " · 身份选定后不能更改" : ""}</p>
+<p class="muted">${escapeHtml(user.login)} · 授权后跳转到 ${escapeHtml(host)}${fixed ? "" : " · 身份选定后不能更改"}</p>
 <div class="roles">${roles.map(roleRow).join("")}</div>
 <div class="actions"><button name="decision" value="approve" class="primary">授权</button><button name="decision" value="deny">拒绝</button></div>
 </form>`,

@@ -15,13 +15,14 @@ import {
   OfferCreateInput,
   OfferRespondInput,
   QuotaGetInput,
+  checkResume,
 } from "../schemas";
 import { addCursor, paginate, type Where } from "../search";
 import {
   ACTIVE_STATUSES,
   APPLICATION_STATUSES,
   CONTACT_STATUSES,
-    type ApplicationStatus,
+  type ApplicationStatus,
 } from "../taxonomy";
 import { beijingDate, beijingDay, newId, nowIso, parseJson, randomHex } from "../util";
 import { candidatePublic, loadCandidate, missingForApply, pdfInfo } from "./candidates";
@@ -29,6 +30,10 @@ import { acceptsApplications, loadJob } from "./jobs";
 import { deliverMatches } from "./subscriptions";
 
 const REAPPLY_DAYS = 7;
+/** 一条邀约最多改几次时间。不限的话招聘者能反复改，每改一次求职者收一条事件 */
+const MAX_RESCHEDULES = 3;
+/** 面试时间最远能约到多少天以后 */
+const MAX_SLOT_DAYS = 365;
 
 interface AppRow {
   id: string;
@@ -141,6 +146,8 @@ interface TransitionOpts {
   note?: string;
   set?: Record<string, string | null>;
   event: { to: Role; type: string };
+  /** 和改状态一起判断的附加条件。不成立时整体不生效，抛出 error */
+  guard?: { sql: string; params: unknown[]; error: HireError };
 }
 
 const TERMINAL: ApplicationStatus[] = ["hired", "rejected", "withdrawn", "closed"];
@@ -181,9 +188,9 @@ async function transition(
     db
       .prepare(
         `UPDATE applications SET status = ?, rev = ?, updated_at = ?${cols.map((c) => `, ${c} = ?`).join("")}
-         WHERE id = ? AND rev = ?`,
+         WHERE id = ? AND rev = ?${opts.guard ? ` AND (${opts.guard.sql})` : ""}`,
       )
-      .bind(to, rev, now, ...cols.map((c) => set[c] ?? null), app.id, app.rev),
+      .bind(to, rev, now, ...cols.map((c) => set[c] ?? null), app.id, app.rev, ...(opts.guard?.params ?? [])),
     db
       .prepare(
         `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
@@ -208,6 +215,7 @@ async function transition(
   ]);
   if (!results[0]?.meta.changes) {
     const fresh = await loadApp(db, app.id);
+    if (opts.guard && fresh.rev === app.rev) throw opts.guard.error;
     throw new HireError("invalid_transition", "这条投递刚刚被改动过。重新读取后再决定下一步。", {
       current_status: fresh.status,
     });
@@ -314,6 +322,12 @@ async function latestBetween(db: D1Database, jobId: string, candidateId: string)
 function checkRepeat(last: { id: string; status: ApplicationStatus; ended_at: string | null } | null): void {
   if (!last) return;
   if (ACTIVE_STATUSES.includes(last.status)) throw duplicate(last);
+  if (last.status === "hired") {
+    throw new HireError("duplicate_application", "这位求职者已经被这个岗位录用，不能再发起新的投递。", {
+      application_id: last.id,
+      status: last.status,
+    });
+  }
   if (last.status !== "rejected" && last.status !== "withdrawn") return;
   const retryAt = new Date(new Date(last.ended_at ?? 0).getTime() + REAPPLY_DAYS * 86400000);
   if (retryAt.getTime() > Date.now()) throw duplicate(last, retryAt.toISOString());
@@ -324,6 +338,9 @@ function checkSlots(slots: string[]): string[] {
   const normalized = slots.map((s) => new Date(s));
   if (normalized.some((d) => d.getTime() <= now)) {
     throw invalid([{ field: "slots", message: "面试时间必须在将来。" }]);
+  }
+  if (normalized.some((d) => d.getTime() > now + MAX_SLOT_DAYS * 86400000)) {
+    throw invalid([{ field: "slots", message: `面试时间最远只能约到 ${MAX_SLOT_DAYS} 天以后。` }]);
   }
   return [...new Set(normalized.map((d) => d.toISOString()))];
 }
@@ -426,6 +443,7 @@ export const applicationOps = [
         });
       }
       checkRepeat(await latestBetween(ctx.db, job.id, me));
+      if (input.custom_resume) checkResume(input.custom_resume, "custom_resume.");
       const answers = checkAnswers(parseJson<Question[]>(job.questions, []), input.answers);
 
       const id = await insertApplication(ctx.db, {
@@ -503,6 +521,7 @@ export const applicationOps = [
     path: "/applications/:application_id",
     scopes: ["candidate:read", "recruiter:read"],
     readOnly: false,
+    readOnlyFor: ["candidate"],
     idempotent: true,
     input: ApplicationGetInput,
     handler: async (ctx, input) => {
@@ -594,7 +613,7 @@ export const applicationOps = [
     name: "invitation_create",
     title: "发出面试邀约",
     description:
-      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递，对一条还没回应的邀约再调一次就是改时间；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间，线下面试要写地址。主动邀约每个岗位每天最多 20 次；对方拒绝或撤回后 7 天内不能再邀约同一个人。",
+      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递，对已经发出的邀约再调一次就是改时间；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间，线下面试要写地址。改时间每条投递最多 3 次；对方已经接受的面试也能改，改完要等对方重新选时间，这期间看不到联系方式。主动邀约每个岗位每天最多 20 次；对方拒绝或撤回后 7 天内不能再邀约同一个人。",
     method: "POST",
     path: "/invitations",
     scopes: ["recruiter:invite"],
@@ -620,11 +639,30 @@ export const applicationOps = [
       if (input.application_id) {
         const app = await loadApp(ctx.db, input.application_id);
         mustOwn(ctx, app, "recruiter");
-        await transition(ctx.db, app, ["applied", "viewed", "invited"], "invited", {
+        const reschedule = app.status === "invited" || app.status === "accepted";
+        if (reschedule) {
+          const row = await ctx.db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM application_logs
+               WHERE application_id = ? AND actor = 'recruiter' AND to_status = 'invited'
+                 AND from_status IN ('invited', 'accepted')`,
+            )
+            .bind(app.id)
+            .first<{ n: number }>();
+          if ((row?.n ?? 0) >= MAX_RESCHEDULES) {
+            throw new HireError(
+              "invalid_transition",
+              `这条邀约已经改过 ${MAX_RESCHEDULES} 次时间，不能再改。确实约不上就用 application_reject 结束，原因选 availability。`,
+              { current_status: app.status, reschedules: row?.n },
+            );
+          }
+        }
+        // 已经约好的面试改时间：回到“已邀约”，等对方重新选
+        await transition(ctx.db, app, ["applied", "viewed", "invited", "accepted"], "invited", {
           actor: "recruiter",
           note: input.note,
-          set: { invitation: JSON.stringify(invitation) },
-          event: { to: "candidate", type: app.status === "invited" ? "invitation.updated" : "invitation.created" },
+          set: { invitation: JSON.stringify(invitation), chosen_slot: null },
+          event: { to: "candidate", type: reschedule ? "invitation.updated" : "invitation.created" },
         });
         return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
       }
@@ -692,7 +730,7 @@ export const applicationOps = [
     name: "offer_create",
     title: "发出录用",
     description:
-      "招聘者在面试之后向求职者发出录用。只有“已接受”邀约的投递可以发。可以写明入职日期、薪资和答复期限。面试没通过请用 application_reject，reason 选 interview_failed。发出前先让用户确认。",
+      "招聘者在面试之后向求职者发出录用。只有“已接受”邀约的投递可以发。可以写明入职日期、薪资和答复期限；过了答复期限对方不能再接受，录用自动结束。面试没通过请用 application_reject，reason 选 interview_failed。发出前先让用户确认。",
     method: "POST",
     path: "/applications/:application_id/offer",
     scopes: ["recruiter:invite"],
@@ -727,7 +765,7 @@ export const applicationOps = [
     name: "offer_respond",
     title: "回应录用",
     description:
-      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。岗位填了招聘人数、录用人数到了的话，岗位会自动暂停。这一步不能撤销，回应前先让用户确认。",
+      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。过了答复期限（offer.reply_by）或岗位已经招满时不能再接受。这一步不能撤销，回应前先让用户确认。",
     method: "POST",
     path: "/applications/:application_id/offer/respond",
     scopes: ["candidate:apply"],
@@ -737,10 +775,31 @@ export const applicationOps = [
     handler: async (ctx, input) => {
       const app = await loadApp(ctx.db, input.application_id);
       mustOwn(ctx, app, "candidate");
+      const replyBy = parseJson<{ reply_by?: string | null } | null>(app.offer, null)?.reply_by;
+      if (input.accept && app.status === "offered" && replyBy && replyBy < beijingDate()) {
+        throw new HireError("invalid_transition", "这份录用已经过了答复期限，不能再接受。想去的话请对方重新发。", {
+          current_status: app.status,
+          reply_by: replyBy,
+        });
+      }
       await transition(ctx.db, app, ["offered"], input.accept ? "hired" : "rejected", {
         actor: "candidate",
         note: input.note,
         event: { to: "recruiter", type: input.accept ? "offer.accepted" : "application.rejected" },
+        // 招满的判断和改状态放在一条语句里，两个人同时接受最后一个名额时只有一个成功
+        ...(input.accept
+          ? {
+              guard: {
+                sql: `SELECT j.headcount IS NULL OR
+                        (SELECT COUNT(*) FROM applications h WHERE h.job_id = j.id AND h.status = 'hired') < j.headcount
+                      FROM jobs j WHERE j.id = ?`,
+                params: [app.job_id],
+                error: new HireError("job_not_open", "这个岗位已经招满，这份录用不能再接受。", {
+                  current_status: app.job_status,
+                }),
+              },
+            }
+          : {}),
       });
       // 录用人数到了招聘人数，岗位自动暂停，等招聘者决定是关闭还是继续招
       if (input.accept) {
@@ -770,7 +829,7 @@ export const applicationOps = [
       await hitRate(ctx.db, `poll:${ctx.auth.accountId}`, limits(ctx.env).pollPerMin, "每分钟拉取事件的次数");
       const role = ctx.auth.role;
       if (!role || !ctx.auth.scopes.size) return { events: [], next_after: input.after ?? 0, has_more: false };
-      if (role === "candidate") await deliverMatches(ctx);
+      const moreMatches = role === "candidate" ? await deliverMatches(ctx) : false;
       const account = await ctx.db
         .prepare("SELECT events_cursor FROM accounts WHERE id = ?")
         .bind(ctx.auth.accountId)
@@ -785,12 +844,14 @@ export const applicationOps = [
         .bind(ctx.auth.accountId, after, role, limit + 1)
         .all<{ seq: number; type: string; application_id: string | null; payload: string; created_at: string }>();
       const page = results.slice(0, limit);
-      const nextAfter = page[page.length - 1]?.seq ?? after;
-      // 记下拉到哪了。下次不传 after 就从这里接着拉，agent 换了会话也不会把旧事件再报一遍
-      if (nextAfter > (account?.events_cursor ?? 0)) {
+      const last = page[page.length - 1]?.seq;
+      const nextAfter = last ?? after;
+      // 记下拉到哪了。下次不传 after 就从这里接着拉，agent 换了会话也不会把旧事件再报一遍。
+      // 只按真正返回过的事件往前挪：调用方传一个很大的 after 不能把游标拨到还没发生的事件后面
+      if (last !== undefined && last > (account?.events_cursor ?? 0)) {
         await ctx.db
           .prepare("UPDATE accounts SET events_cursor = ? WHERE id = ? AND events_cursor < ?")
-          .bind(nextAfter, ctx.auth.accountId, nextAfter)
+          .bind(last, ctx.auth.accountId, last)
           .run();
       }
       return {
@@ -802,7 +863,7 @@ export const applicationOps = [
           created_at: e.created_at,
         })),
         next_after: nextAfter,
-        has_more: results.length > limit,
+        has_more: results.length > limit || moreMatches,
       };
     },
   }),
@@ -861,7 +922,8 @@ const EXPIRE_DAYS = 30;
 
 /**
  * 每天清一次没人管的投递，改成“已关闭”，给双方各发一条事件：
- * 投递 30 天没等到决定；邀约给的时间全过了还没回应；约好的面试过了 30 天没有结果；录用发出 30 天没回应。
+ * 投递 30 天没等到决定；邀约给的时间全过了还没回应；约好的面试过了 30 天没有结果；
+ * 录用过了答复期限，或者发出 30 天没回应。
  */
 export async function expireStale(db: D1Database): Promise<number> {
   const now = nowIso();
@@ -882,6 +944,11 @@ export async function expireStale(db: D1Database): Promise<number> {
       where: "a.status = 'accepted' AND a.chosen_slot < ?",
       params: [cutoff],
       note: `面试时间过去 ${EXPIRE_DAYS} 天没有结果，自动结束。`,
+    },
+    {
+      where: "a.status = 'offered' AND json_extract(a.offer, '$.reply_by') < ?",
+      params: [beijingDate()],
+      note: "录用过了答复期限，没有回应，自动结束。",
     },
     {
       where: "a.status = 'offered' AND a.updated_at < ?",

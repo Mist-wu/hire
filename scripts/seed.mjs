@@ -70,10 +70,10 @@ const sql = [...accountSql("owner", ownerId, ownerLogin, "recruiter")];
 data.candidates.forEach((c, i) => sql.push(...accountSql(c.login, -(900001 + i), c.login, "candidate")));
 for (const c of data.companies) {
   sql.push(
-    `INSERT INTO companies (id, owner_account_id, name, industry, scale, stage, website, intro, contact_email, created_at, updated_at)
-     VALUES (${q(`com_demo_${c.key}`)}, (SELECT id FROM accounts WHERE github_id = ${ownerId}), ${q(c.name)}, ${q(c.industry)},
+    `INSERT INTO companies (id, owner_account_id, name, name_key, industry, scale, stage, website, intro, contact_email, created_at, updated_at)
+     VALUES (${q(`com_demo_${c.key}`)}, (SELECT id FROM accounts WHERE github_id = ${ownerId}), ${q(c.name)}, ${q(c.name.normalize("NFKC").replace(/\s+/g, "").toLowerCase())}, ${q(c.industry)},
              ${q(c.scale)}, ${q(c.stage)}, ${q(c.website)}, ${q(c.intro)}, ${q(c.contact_email)}, ${q(now)}, ${q(now)})
-     ON CONFLICT (id) DO UPDATE SET name = excluded.name, industry = excluded.industry, scale = excluded.scale,
+     ON CONFLICT (id) DO UPDATE SET name = excluded.name, name_key = excluded.name_key, industry = excluded.industry, scale = excluded.scale,
        stage = excluded.stage, website = excluded.website, intro = excluded.intro,
        contact_email = excluded.contact_email, updated_at = excluded.updated_at;`,
   );

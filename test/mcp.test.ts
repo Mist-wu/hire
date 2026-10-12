@@ -35,8 +35,8 @@ describe("MCP", () => {
     const search = tools.find((t: any) => t.name === "jobs_search");
     expect(search.annotations.readOnlyHint).toBe(true);
     expect(search.inputSchema.properties.recruit_type.enum).toContain("intern_daily");
-    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(7);
-    expect(tools.find((t: any) => t.name === "application_get").annotations.readOnlyHint).toBe(false);
+    expect(tools.filter((t: any) => t.annotations.readOnlyHint)).toHaveLength(8);
+    expect(tools.find((t: any) => t.name === "application_get").annotations.readOnlyHint).toBe(true);
   });
 
   it("调用工具，出错时返回可读的错误", async () => {

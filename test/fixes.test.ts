@@ -62,8 +62,9 @@ describe("时间", () => {
     expect(moved.data.application).toMatchObject({ status: "invited", invitation: { slots: [slot] } });
     expect((await api("GET", "/events", seeker)).data.events.at(-1)).toMatchObject({ type: "invitation.updated", note: "改到周五。" });
     expect((await api("POST", `/applications/${appId}/respond`, seeker, { accept: true, slot })).status).toBe(200);
-    // 接受之后不能再改
-    expect((await api("POST", "/invitations", hr, { application_id: appId, mode: "online", slots: [future(4)] })).status).toBe(409);
+    // 约好之后也能改：回到“已邀约”，等对方重新选，这期间看不到联系方式
+    const again = await api("POST", "/invitations", hr, { application_id: appId, mode: "online", slots: [future(4)] });
+    expect(again.data.application).toMatchObject({ status: "invited", chosen_slot: null, contact: null });
   });
 
   it("线下面试要写地址，录用日期不能在过去", async () => {

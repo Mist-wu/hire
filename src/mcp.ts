@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import type { Env } from "./env";
+import type { Env, Role } from "./env";
 import { HireError } from "./errors";
 import { OPS, opsFor, requireScope, touchActive } from "./ops";
 import { inputSchema, makeCtx } from "./rest";
@@ -28,7 +28,8 @@ function rpcError(id: RpcRequest["id"], code: number, message: string) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
-function toolDef(op: (typeof OPS)[number]) {
+function toolDef(op: (typeof OPS)[number], role: Role | null) {
+  const readOnly = op.readOnly || (role != null && (op.readOnlyFor?.includes(role) ?? false));
   return {
     name: op.name,
     title: op.title,
@@ -36,9 +37,9 @@ function toolDef(op: (typeof OPS)[number]) {
     inputSchema: inputSchema(op),
     annotations: {
       title: op.title,
-      readOnlyHint: op.readOnly,
-      destructiveHint: op.readOnly ? false : (op.destructive ?? false),
-      idempotentHint: op.readOnly ? true : (op.idempotent ?? false),
+      readOnlyHint: readOnly,
+      destructiveHint: readOnly ? false : (op.destructive ?? false),
+      idempotentHint: readOnly ? true : (op.idempotent ?? false),
       openWorldHint: false,
     },
   };
@@ -92,7 +93,7 @@ export async function handleMcp(c: C): Promise<Response> {
       case "ping":
         return ok({});
       case "tools/list":
-        return ok({ tools: opsFor(ctx.auth).map(toolDef) });
+        return ok({ tools: opsFor(ctx.auth).map((op) => toolDef(op, ctx.auth.role)) });
       case "tools/call": {
         const name = req.params?.name;
         const op = OPS.find((o) => o.name === name);
@@ -121,6 +122,7 @@ export async function handleMcp(c: C): Promise<Response> {
   };
 
   if (Array.isArray(payload)) {
+    if (!payload.length) return c.json(rpcError(null, -32600, "批量请求不能是空数组。"), 400);
     const responses = (await Promise.all(payload.map((item) => handle(item as RpcRequest)))).filter(Boolean);
     return responses.length ? c.json(responses) : c.body(null, 202);
   }

@@ -66,6 +66,11 @@ export function normCity(city: string): string {
   return name.length > 2 && name.endsWith("市") ? name.slice(0, -1) : name;
 }
 
+/** 公司名比较用：全半角统一、去掉空白、不分大小写。 */
+export function nameKey(name: string): string {
+  return name.normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+}
+
 export function parseJson<T>(text: string | null | undefined, fallback: T): T {
   if (!text) return fallback;
   try {

@@ -197,6 +197,16 @@ describe("OAuth", () => {
     expect(denied.data.error).toBe("access_denied");
   });
 
+  it("新账号遇到只申请一种身份的客户端，也会提示身份不能更改", async () => {
+    mockGithub({ id: 4747, login: "single" });
+    const client = (await register()).data;
+    const { challenge } = await pkce();
+    const start = await startAuthorize(client.client_id, challenge, `&scope=${encodeURIComponent("recruiter:read recruiter:write")}`);
+    const done = await consent(start.requestId, start.cookie, "deny");
+    expect(done.html).toContain('type="hidden" name="role" value="recruiter"');
+    expect(done.html).toContain("身份选定后不能更改");
+  });
+
   it("授权请求不合法时不跳转到未登记的地址", async () => {
     const client = (await register()).data;
     const { challenge } = await pkce();

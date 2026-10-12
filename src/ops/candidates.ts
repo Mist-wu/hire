@@ -8,6 +8,7 @@ import {
   EmptyInput,
   ProfileUpdateInput,
   ResumeUploadInput,
+  checkResume,
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
 import { DEGREE_RANK, type Degree } from "../taxonomy";
@@ -158,6 +159,7 @@ export const candidateOps = [
     idempotent: true,
     input: ProfileUpdateInput,
     handler: async (ctx, input) => {
+      checkResume(input);
       const db = ctx.db;
       const id = ctx.auth.accountId;
       const now = nowIso();

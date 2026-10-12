@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import type { Ctx, Scope } from "./env";
+import type { Ctx, Role, Scope } from "./env";
 
 export interface Op {
   /** MCP 工具名 */
@@ -12,6 +12,8 @@ export interface Op {
   /** 有其中任意一个范围即可调用。空数组表示任何令牌都行 */
   scopes: Scope[];
   readOnly: boolean;
+  /** 整体不是只读，但对这些身份是只读 */
+  readOnlyFor?: Role[];
   idempotent?: boolean;
   destructive?: boolean;
   input: z.ZodType;

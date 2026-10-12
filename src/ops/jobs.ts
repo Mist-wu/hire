@@ -17,7 +17,7 @@ import {
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
 import { CATEGORY_NAMES, DEGREE_RANK, PENDING_STATUSES, type Degree } from "../taxonomy";
-import { beijingDate, newId, normCity, nowIso, parseJson, randomHex } from "../util";
+import { beijingDate, nameKey, newId, normCity, nowIso, parseJson, randomHex } from "../util";
 
 export interface CompanyRow {
   id: string;
@@ -62,6 +62,7 @@ export interface JobRow {
   status: string;
   questions: string;
   detail_views: number;
+  opened_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -199,6 +200,23 @@ export async function loadJob(
   return { job, company };
 }
 
+/** 关键词搜索用的文本。公司名也在里面，公司改名时要重算。 */
+function jobSearchText(
+  f: Pick<JobFields, "title" | "category" | "cities" | "skills" | "duties" | "requirements" | "bonus">,
+  companyName: string,
+): string {
+  return [
+    f.title,
+    companyName,
+    CATEGORY_NAMES[f.category] ?? "",
+    f.cities.join(" "),
+    (f.skills ?? []).join(" "),
+    f.duties,
+    f.requirements,
+    f.bonus ?? "",
+  ].join("\n");
+}
+
 function jobWriteStatements(
   db: D1Database,
   id: string,
@@ -206,21 +224,13 @@ function jobWriteStatements(
   f: JobFields,
   status: string,
   createdAt: string,
+  openedAt: string,
   now: string,
 ): D1PreparedStatement[] {
   const cities = [...new Set(f.cities.map(normCity))];
   const skills = [...new Set((f.skills ?? []).map((s) => s.trim()))];
   const gradYears = [...new Set(f.grad_years ?? [])];
-  const searchText = [
-    f.title,
-    company.name,
-    CATEGORY_NAMES[f.category] ?? "",
-    cities.join(" "),
-    skills.join(" "),
-    f.duties,
-    f.requirements,
-    f.bonus ?? "",
-  ].join("\n");
+  const searchText = jobSearchText({ ...f, cities, skills }, company.name);
   const bool = (v: boolean | null | undefined) => (v == null ? null : v ? 1 : 0);
 
   // 这些列在修改岗位时整体覆盖；id、company_id、created_at 只在新建时写
@@ -249,6 +259,7 @@ function jobWriteStatements(
     headcount: f.headcount ?? null,
     deadline: f.deadline ?? null,
     status,
+    opened_at: openedAt,
     questions: JSON.stringify(f.questions ?? []),
     search_text: searchText,
     updated_at: now,
@@ -406,56 +417,91 @@ export const jobOps = [
     handler: async (ctx, input) => {
       const now = nowIso();
       const existing = await primaryCompany(ctx.db, ctx.auth.accountId);
-      if (input.name) {
+      const nameTaken = invalid([{ field: "name", message: "已经有公司叫这个名字，换一个。" }]);
+      const key = input.name ? nameKey(input.name) : null;
+      if (key) {
         const taken = await ctx.db
-          .prepare("SELECT 1 FROM companies WHERE name = ? COLLATE NOCASE AND id <> ?")
-          .bind(input.name, existing?.id ?? "")
+          .prepare("SELECT 1 FROM companies WHERE name_key = ? AND id <> ?")
+          .bind(key, existing?.id ?? "")
           .first();
-        if (taken) throw invalid([{ field: "name", message: "已经有公司叫这个名字，换一个。" }]);
+        if (taken) throw nameTaken;
       }
+      // 唯一索引兜住并发时的重名
+      const run = async (stmts: D1PreparedStatement[]) => {
+        try {
+          return await ctx.db.batch(stmts);
+        } catch (err) {
+          if (String(err).includes("UNIQUE")) throw nameTaken;
+          throw err;
+        }
+      };
       if (!existing) {
         if (!input.name) throw invalid([{ field: "name", message: "第一次创建公司时必须填名称。" }]);
         const id = newId("com");
-        await ctx.db
-          .prepare(
-            `INSERT INTO companies (id, owner_account_id, name, industry, scale, stage, website, intro,
-               contact_email, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            id,
-            ctx.auth.accountId,
-            input.name,
-            input.industry ?? null,
-            input.scale ?? null,
-            input.stage ?? null,
-            input.website ?? null,
-            input.intro ?? null,
-            input.contact_email ?? null,
-            now,
-            now,
-          )
-          .run();
+        // 并发的两次创建只有一次生效，另一次直接返回已有的公司
+        await run([
+          ctx.db
+            .prepare(
+              `INSERT INTO companies (id, owner_account_id, name, name_key, industry, scale, stage, website, intro,
+                 contact_email, created_at, updated_at)
+               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11
+               WHERE NOT EXISTS (SELECT 1 FROM companies WHERE owner_account_id = ?2)`,
+            )
+            .bind(
+              id,
+              ctx.auth.accountId,
+              input.name,
+              key,
+              input.industry ?? null,
+              input.scale ?? null,
+              input.stage ?? null,
+              input.website ?? null,
+              input.intro ?? null,
+              input.contact_email ?? null,
+              now,
+            ),
+        ]);
       } else {
         const pick = <K extends keyof typeof input>(key: K, current: string | null) =>
           input[key] === undefined ? current : (input[key] as string | null);
-        await ctx.db
-          .prepare(
-            `UPDATE companies SET name = ?, industry = ?, scale = ?, stage = ?, website = ?, intro = ?,
-               contact_email = ?, updated_at = ? WHERE id = ?`,
-          )
-          .bind(
-            input.name ?? existing.name,
-            pick("industry", existing.industry),
-            pick("scale", existing.scale),
-            pick("stage", existing.stage),
-            pick("website", existing.website),
-            pick("intro", existing.intro),
-            pick("contact_email", existing.contact_email),
-            now,
-            existing.id,
-          )
-          .run();
+        const name = input.name ?? existing.name;
+        const stmts = [
+          ctx.db
+            .prepare(
+              `UPDATE companies SET name = ?, name_key = ?, industry = ?, scale = ?, stage = ?, website = ?, intro = ?,
+                 contact_email = ?, updated_at = ? WHERE id = ?`,
+            )
+            .bind(
+              name,
+              nameKey(name),
+              pick("industry", existing.industry),
+              pick("scale", existing.scale),
+              pick("stage", existing.stage),
+              pick("website", existing.website),
+              pick("intro", existing.intro),
+              pick("contact_email", existing.contact_email),
+              now,
+              existing.id,
+            ),
+        ];
+        if (name !== existing.name) {
+          // 岗位的搜索文本里有公司名，改名后要跟着重算，不然按新名字搜不到
+          const { results: jobs } = await ctx.db
+            .prepare("SELECT * FROM jobs WHERE company_id = ?")
+            .bind(existing.id)
+            .all<JobRow>();
+          for (const job of jobs) {
+            const text = jobSearchText(jobFieldsFromRow(job), name);
+            stmts.push(
+              ctx.db.prepare("UPDATE jobs SET search_text = ? WHERE id = ?").bind(text, job.id),
+              ctx.db.prepare("DELETE FROM jobs_fts WHERE job_id = ?").bind(job.id),
+              ctx.db.prepare("INSERT INTO jobs_fts (job_id, body) VALUES (?, ?)").bind(job.id, text),
+            );
+          }
+        }
+        // 每个岗位占 3 条语句。岗位多时分批提交，按 3 的倍数切
+        await run(stmts.slice(0, 1 + 60));
+        for (let i = 61; i < stmts.length; i += 60) await run(stmts.slice(i, i + 60));
       }
       const company = await primaryCompany(ctx.db, ctx.auth.accountId);
       return { company: companyToApi(company!, { withContact: true }) };
@@ -493,7 +539,7 @@ export const jobOps = [
       }
       const id = newId("job");
       const now = nowIso();
-      await ctx.db.batch(jobWriteStatements(ctx.db, id, company, fields, "open", now, now));
+      await ctx.db.batch(jobWriteStatements(ctx.db, id, company, fields, "open", now, now, now));
       return { job: await getJob(ctx, id) };
     },
   }),
@@ -521,9 +567,11 @@ export const jobOps = [
       const merged = parseInput(JobFields, { ...jobFieldsFromRow(job), ...defined });
       checkJob(merged);
       if (patch.deadline !== undefined) checkDeadline(patch.deadline);
-      await ctx.db.batch(
-        jobWriteStatements(ctx.db, job.id, company, merged, status ?? job.status, job.created_at, nowIso()),
-      );
+      const now = nowIso();
+      const next = status ?? job.status;
+      // 暂停后重开算一次新的开放，订阅会把它当新岗位补发
+      const openedAt = job.status === "paused" && next === "open" ? now : (job.opened_at ?? job.created_at);
+      await ctx.db.batch(jobWriteStatements(ctx.db, job.id, company, merged, next, job.created_at, openedAt, now));
       return { job: await getJob(ctx, job.id) };
     },
   }),

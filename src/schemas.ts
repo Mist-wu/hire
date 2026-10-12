@@ -24,6 +24,9 @@ const httpUrl = z
   .url({ protocol: /^https?$/ })
   .max(300)
   .describe("http 或 https 地址");
+/** 薪资上限。挡住乱填的天文数字 */
+const MAX_SALARY = 10_000_000;
+const salary = () => z.int().min(0).max(MAX_SALARY);
 const month = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "格式为 YYYY-MM");
 const id = (what: string) => z.string().min(1).max(64).describe(`${what}编号`);
 
@@ -65,8 +68,8 @@ const jobShape = {
   experience: ExperienceEnum,
   degree: DegreeEnum.describe(`最低学历要求：${ENUM_DOCS.degree}`),
   grad_years: z.array(z.int().min(2000).max(2100)).max(6).optional().describe("面向届别，如 [2027, 2028]"),
-  salary_min: z.int().min(0).nullable().optional().describe("薪资下限。不面议时必填"),
-  salary_max: z.int().min(0).nullable().optional().describe("薪资上限。不面议时必填"),
+  salary_min: salary().nullable().optional().describe("薪资下限。不面议时必填"),
+  salary_max: salary().nullable().optional().describe("薪资上限。不面议时必填"),
   salary_unit: SalaryUnitEnum.nullable().optional(),
   salary_negotiable: z.boolean().optional().describe("是否面议，默认 false"),
   days_per_week: z.int().min(1).max(7).nullable().optional().describe("每周到岗天数。实习岗位必填，其他类型不要传"),
@@ -150,7 +153,7 @@ const jobFilterShape = {
   grad_year: z.int().min(2000).max(2100).optional().describe("你的毕业年份。只返回面向这一届或不限届别的岗位"),
   days_per_week_max: z.int().min(1).max(7).optional().describe("你每周最多能到岗几天"),
   min_months_max: z.int().min(1).max(24).optional().describe("你最多能实习几个月"),
-  salary_min: z.int().min(0).optional().describe("期望的最低薪资，必须和 salary_unit 一起传。只匹配同一单位、上限不低于它的岗位"),
+  salary_min: salary().optional().describe("期望的最低薪资，必须和 salary_unit 一起传。只匹配同一单位、上限不低于它的岗位"),
   salary_unit: SalaryUnitEnum.optional(),
   skills: z.array(str(30)).max(10).optional().describe("技能标签，命中任意一个即可"),
   company_id: id("公司").optional(),
@@ -215,11 +218,24 @@ const resumeShape = {
 export const ResumeContent = z.strictObject(resumeShape).partial();
 export type ResumeContent = z.infer<typeof ResumeContent>;
 
+/** 经历的结束时间不能早于开始时间。 */
+export function checkResume(content: ResumeContent, prefix = ""): void {
+  const issues: FieldIssue[] = [];
+  for (const key of ["education", "experience", "projects"] as const) {
+    content[key]?.forEach((item, i) => {
+      if (item.start && item.end && item.end < item.start) {
+        issues.push({ field: `${prefix}${key}.${i}.end`, message: "结束时间不能早于开始时间。" });
+      }
+    });
+  }
+  if (issues.length) throw invalid(issues);
+}
+
 export const Expectation = z.strictObject({
   recruit_types: z.array(RecruitTypeEnum).max(5).optional().describe("想找的招聘类型"),
   cities: z.array(str(20)).max(10).optional().describe("期望城市"),
   days_per_week: z.int().min(1).max(7).optional().describe("每周能到岗几天"),
-  salary_min: z.int().min(0).optional(),
+  salary_min: salary().optional(),
   salary_unit: SalaryUnitEnum.optional(),
   available_from: z.iso.date().optional().describe("最早到岗日期，YYYY-MM-DD"),
   duration_months: z.int().min(1).max(36).optional().describe("能实习几个月"),
@@ -293,9 +309,9 @@ export const ApplicationRejectInput = z.strictObject({
 export const OfferCreateInput = z.strictObject({
   application_id: id("投递"),
   start_date: z.iso.date().optional().describe("入职日期，YYYY-MM-DD"),
-  salary: z.int().min(0).optional().describe("录用薪资，必须和 salary_unit 一起传"),
+  salary: salary().optional().describe("录用薪资，必须和 salary_unit 一起传"),
   salary_unit: SalaryUnitEnum.optional(),
-  reply_by: z.iso.date().optional().describe("希望对方在这一天前答复，YYYY-MM-DD"),
+  reply_by: z.iso.date().optional().describe("答复期限，YYYY-MM-DD。过了这一天对方不能再接受"),
   note,
 });
 
@@ -347,7 +363,23 @@ export function zodIssues(error: z.ZodError): FieldIssue[] {
   }));
 }
 
+// 换行和制表符之外的控制字符
+const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+function controlIssues(value: unknown, path: string, out: FieldIssue[]): void {
+  if (typeof value === "string") {
+    if (CONTROL.test(value)) out.push({ field: path || "(整体)", message: "含有不可见的控制字符，去掉后重试。" });
+  } else if (Array.isArray(value)) {
+    value.forEach((item, i) => controlIssues(item, path ? `${path}.${i}` : String(i), out));
+  } else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) controlIssues(item, path ? `${path}.${key}` : key, out);
+  }
+}
+
 export function parseInput<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
+  const control: FieldIssue[] = [];
+  controlIssues(value, "", control);
+  if (control.length) throw invalid(control);
   const result = schema.safeParse(value ?? {});
   if (!result.success) throw invalid(zodIssues(result.error));
   return result.data;

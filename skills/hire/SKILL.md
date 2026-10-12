@@ -66,7 +66,7 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 2. 结果里 `my_application` 不为空的岗位已经投过，不要再投。`recruiter_active_at` 是招聘者最近活跃时间。很久没活跃的岗位排到后面，或用 `active_within_days` 直接滤掉。
 3. 服务端不打分。对看起来相关的岗位逐个调 `job_get` 读职责和要求，对照用户的资料自己判断。`recruiter.decision_rate` 是这家公司对投递做出决定（邀约或拒绝）的比例，偏低时提醒用户。
 4. 把合适的岗位列给用户：公司、岗位、城市、每周天数、薪资、为什么合适、哪里不匹配。由用户决定投哪些。
-5. 用户想持续关注某类岗位时，用 `subscription_create` 保存搜索条件。之后有新岗位符合，`events_poll` 里会出现 `job.matched`，用 `job_get` 读详情再告诉用户。最多 5 个订阅。
+5. 用户想持续关注某类岗位时，用 `subscription_create` 保存搜索条件。之后有新岗位符合，`events_poll` 里会出现 `job.matched`，用 `job_get` 读详情再告诉用户。同一个岗位只通知一次。最多 5 个订阅。
 
 **投递。**
 
@@ -77,11 +77,11 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 
 **跟进。**
 
-1. 用 `events_poll` 看进展。不用传参数，服务端记着上次拉到哪，只返回新事件。
-2. 收到 `invitation.created` 或 `invitation.updated`（对方改了时间）时，调 `application_get` 读邀约：面试方式、可选时间、备注。把它们告诉用户。
+1. 用 `events_poll` 看进展。不用传参数，服务端记着上次拉到哪，只返回新事件。`has_more` 为 true 时马上再调一次。
+2. 收到 `invitation.created` 或 `invitation.updated`（对方改了时间）时，调 `application_get` 读邀约：面试方式、可选时间、备注。把它们告诉用户。已经约好的面试也可能被对方改时间，这时投递回到“已邀约”，要重新选一次。
 3. 用户决定后调 `invitation_respond`。接受时 `slot` 必须是邀约给出的时间之一，而且还没过。时间都不合适就拒绝，在备注里请对方改时间。接受后对方会看到手机和邮箱，这一步不能撤销。
 4. 接受后再调 `application_get`，`contact` 里有公司的联系邮箱。
-5. 收到 `offer.created` 时，调 `application_get` 读 `offer`：入职日期、薪资、答复期限。告诉用户，由用户决定后调 `offer_respond`。
+5. 收到 `offer.created` 时，调 `application_get` 读 `offer`：入职日期、薪资、答复期限。告诉用户，由用户决定后调 `offer_respond`。过了答复期限就不能接受了，要提醒用户期限是哪天。返回 `job_not_open` 表示岗位已经招满。
 6. 收到 `application.rejected` 时，事件里的 `reason` 是对方选的原因，转告用户。
 7. 收到 `application.expired` 表示这条投递太久没人处理，已自动结束。可以马上再投。
 
@@ -89,7 +89,7 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 
 **第一次使用：建公司。**
 
-调 `company_get`。返回 `company: null` 时，问清公司名称、行业、规模、联系邮箱，调 `company_upsert`。公司不能和已有的重名。
+调 `company_get`。返回 `company: null` 时，问清公司名称、行业、规模、联系邮箱，调 `company_upsert`。公司不能和已有的重名，大小写、全半角、空白不同也算重名。
 
 **发岗位。**
 
@@ -105,12 +105,12 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 1. `events_poll` 里出现 `application.created` 时，用 `job_applications_list` 列出这个岗位的投递。
 2. 调 `application_get` 读简历和 `answers`（筛选问题的回答）。第一次调用会把投递标成“已查看”，求职者会收到通知。
 3. 对照岗位要求给用户一个判断：符合哪几条，缺哪几条。由用户决定下一步。
-4. 邀约用 `invitation_create`，传 `application_id`、面试方式和 1 到 5 个可选时间。时间要带时区，如 `2026-10-20T14:00:00+08:00`。线下面试要写地址。对方还没回应时，想改时间就再调一次。
+4. 邀约用 `invitation_create`，传 `application_id`、面试方式和 1 到 5 个可选时间。时间要带时区，如 `2026-10-20T14:00:00+08:00`。线下面试要写地址。想改时间就再调一次，对方已经接受了也可以改，改完要等对方重新选时间。一条投递最多改 3 次，改之前先和用户确认新时间。
 5. 不合适用 `application_reject`，`reason` 必填，从枚举里选最接近的一个，备注里可以再写一句。
 
 **面试之后。**
 
-1. 问用户面试结果。通过用 `offer_create`，可以写入职日期、薪资和答复期限。
+1. 问用户面试结果。通过用 `offer_create`，可以写入职日期、薪资和答复期限。过了答复期限对方不能再接受。岗位填了招聘人数时，招满后剩下的录用也不能再接受，要继续招就先用 `job_update` 加名额。
 2. 没通过用 `application_reject`，`reason` 选 `interview_failed`。
 3. 对方接受录用时会收到 `offer.accepted`。
 
