@@ -1,5 +1,5 @@
 import type { Ctx } from "../env";
-import { HireError, invalid, notFound } from "../errors";
+import { invalid, notFound } from "../errors";
 import { hitRate, limits } from "../quota";
 import { defineOp } from "../registry";
 import {
@@ -11,13 +11,12 @@ import {
   checkResume,
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
-import { DEGREE_RANK, type Degree } from "../taxonomy";
-import { ACTIVE_STATUSES } from "../taxonomy";
+import { ACTIVE_STATUSES, DEGREE_RANK, type Degree } from "../taxonomy";
 import { base64ToBytes, normCity, nowIso, parseJson, randomHex } from "../util";
 
-export const MAX_PDF_BYTES = 5 * 1024 * 1024;
+const MAX_PDF_BYTES = 5 * 1024 * 1024;
 
-export interface CandidateRow {
+interface CandidateRow {
   account_id: string;
   name: string | null;
   school: string | null;
@@ -53,22 +52,12 @@ interface ExpectationData {
 /** 公开简历。不含手机、邮箱和 PDF。 */
 export function candidatePublic(row: CandidateRow) {
   return {
-    id: row.account_id,
-    name: row.name,
-    school: row.school,
-    degree: row.degree,
-    major: row.major,
-    grad_year: row.grad_year,
-    city: row.city,
+    ...candidateSummary(row),
     summary: row.summary,
-    skills: parseJson<string[]>(row.skills, []),
     education: parseJson<unknown[]>(row.education, []),
     experience: parseJson<unknown[]>(row.experience, []),
     projects: parseJson<unknown[]>(row.projects, []),
     links: parseJson<string[]>(row.links, []),
-    expectation: parseJson<ExpectationData>(row.expectation, {}),
-    active_at: row.active_at,
-    updated_at: row.updated_at,
   };
 }
 
@@ -131,7 +120,7 @@ async function myContacts(ctx: Ctx, candidateIds: string[]) {
   return out;
 }
 
-export const candidateOps = [
+export const profileOps = [
   defineOp({
     name: "profile_get",
     title: "查看我的资料",
@@ -294,7 +283,7 @@ export const candidateOps = [
     handler: async (ctx, input) => {
       const bytes = base64ToBytes(input.content_base64);
       if (!bytes) throw invalid([{ field: "content_base64", message: "不是合法的 base64。" }]);
-      return storePdf(ctx, input.filename, bytes);
+      return storePdf(ctx, input.filename, bytes, "content_base64");
     },
   }),
 
@@ -346,13 +335,16 @@ export const candidateOps = [
         db.prepare("DELETE FROM candidate_recruit_types WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM candidates_fts WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM subscriptions WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM job_notifications WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM candidates WHERE account_id = ?").bind(id),
       ]);
       if (old?.pdf_key) await ctx.env.FILES.delete(old.pdf_key);
       return { deleted: old != null, withdrawn_applications: withdrawn?.meta.changes ?? 0 };
     },
   }),
+];
 
+export const candidateSearchOps = [
   defineOp({
     name: "candidates_search",
     title: "搜索求职者",
@@ -453,13 +445,11 @@ export const candidateOps = [
   }),
 ];
 
-export async function storePdf(ctx: Ctx, filename: string, bytes: Uint8Array) {
-  if (bytes.byteLength > MAX_PDF_BYTES) {
-    throw invalid([{ field: "content_base64", message: "文件超过 5 MB。" }]);
-  }
-  const header = new TextDecoder().decode(bytes.slice(0, 5));
-  if (header !== "%PDF-") {
-    throw invalid([{ field: "content_base64", message: "这不是 PDF 文件。只接受 PDF。" }]);
+/** field 是出错时报给调用方的位置：JSON 里的 content_base64、multipart 的 file，或者整个请求体。 */
+export async function storePdf(ctx: Ctx, filename: string, bytes: Uint8Array, field: string) {
+  if (bytes.byteLength > MAX_PDF_BYTES) throw invalid([{ field, message: "文件超过 5 MB。" }]);
+  if (new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") {
+    throw invalid([{ field, message: "这不是 PDF 文件。只接受 PDF。" }]);
   }
   const id = ctx.auth.accountId;
   const old = await loadCandidate(ctx.db, id);

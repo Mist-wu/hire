@@ -1,10 +1,10 @@
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import { ROLE_NAMES, ROLE_SCOPES, SCOPES, roleOfScopes, type Env, type Role, type Scope } from "../env";
+import { ROLE_NAMES, ROLE_SCOPES, SCOPES, roleOfScopes, rolesOfScopes, type Env, type Role, type Scope } from "../env";
 import { HireError } from "../errors";
 import { escapeHtml, isoAfter, newId, nowIso, parseJson, randomHex, safeEqual, sha256Base64url, sha256Hex } from "../util";
 import { authorizeUrl, exchangeCode, getUser, githubConfig, pollDevice, startDevice } from "./github";
-import { accountRole, claimRole, issueTokens, parseScopes, upsertAccount } from "./tokens";
+import { accountRole, claimRole, issueTokens, parseScopes, requestedScopes, resourceUri, upsertAccount } from "./tokens";
 
 type C = Context<{ Bindings: Env }>;
 
@@ -29,6 +29,22 @@ function oauthError(c: C, error: string, description: string, status: 400 | 401 
 function origin(c: C): string {
   return new URL(c.req.url).origin;
 }
+
+/** 客户端请求的 resource。没传用默认资源；传了别的返回 null，调用方回 invalid_target。 */
+function target(c: C, raw: string | undefined): string | null {
+  const resource = resourceUri(origin(c));
+  return raw === undefined || raw === resource ? resource : null;
+}
+
+function targetHint(c: C): string {
+  return `resource 只能是 ${resourceUri(origin(c))}，或者不传。`;
+}
+
+function invalidTarget(c: C) {
+  return oauthError(c, "invalid_target", targetHint(c));
+}
+
+const SCOPE_HINT = `求职者用 "${ROLE_SCOPES.candidate.join(" ")}"，招聘者用 "${ROLE_SCOPES.recruiter.join(" ")}"。`;
 
 async function body(c: C): Promise<Record<string, string>> {
   const type = c.req.header("Content-Type") ?? "";
@@ -131,10 +147,6 @@ function grantable(request: { scopes: string | null }): Scope[] {
   return requested.length ? requested : [...SCOPES];
 }
 
-function rolesIn(scopes: Scope[]): Role[] {
-  return (["candidate", "recruiter"] as Role[]).filter((role) => scopes.some((s) => s.startsWith(`${role}:`)));
-}
-
 function wrongRole(actual: Role): string {
   return `这个 GitHub 账号已经是${ROLE_NAMES[actual]}，不能再用另一种身份登录。一个账号只能有一种身份。`;
 }
@@ -188,7 +200,7 @@ oauth.get("/.well-known/openid-configuration", (c) => c.json(metadata(c)));
 function protectedResource(c: C) {
   const base = origin(c);
   return c.json({
-    resource: `${base}/mcp`,
+    resource: resourceUri(base),
     authorization_servers: [base],
     scopes_supported: SCOPES,
     bearer_methods_supported: ["header"],
@@ -249,8 +261,15 @@ oauth.get("/oauth/authorize", async (c) => {
     .bind(q.client_id ?? "")
     .first<{ id: string; redirect_uris: string }>();
   if (!client) return failPage("client_id 无效。请让客户端重新注册。");
-  const redirectUri = q.redirect_uri ?? "";
-  if (!redirectMatches(parseJson<string[]>(client.redirect_uris, []), redirectUri)) {
+  // 只登记了一个地址时可以不传 redirect_uri；显式传了就必须匹配
+  const registered = parseJson<string[]>(client.redirect_uris, []);
+  let redirectUri: string;
+  if (q.redirect_uri === undefined) {
+    if (registered.length !== 1) return failPage("客户端登记了多个 redirect_uri，授权请求里必须指明用哪一个。");
+    redirectUri = registered[0]!;
+  } else if (redirectMatches(registered, q.redirect_uri)) {
+    redirectUri = q.redirect_uri;
+  } else {
     return failPage("redirect_uri 和客户端注册时登记的不一致。");
   }
   const back = (error: string, description: string) =>
@@ -264,7 +283,11 @@ oauth.get("/oauth/authorize", async (c) => {
   } catch {
     return back("server_error", "服务端还没有配置 GitHub 登录");
   }
-  const scopes = parseScopes(q.scope ?? "");
+  // 写了不认识的范围要报错。悄悄忽略的话，只剩空集合，确认页会按“没申请”列出全部权限
+  const scopes = requestedScopes(q.scope);
+  if (!scopes) return back("invalid_scope", `scope 里有不认识的值。${SCOPE_HINT}`);
+  const resource = target(c, q.resource);
+  if (!resource) return back("invalid_target", targetHint(c));
   const id = newId("req");
   const csrf = randomHex(24);
   await c.env.DB.prepare(
@@ -279,7 +302,7 @@ oauth.get("/oauth/authorize", async (c) => {
       q.state ?? null,
       q.code_challenge,
       scopes.length ? JSON.stringify(scopes) : null,
-      q.resource ?? null,
+      resource,
       isoAfter(REQUEST_TTL),
     )
     .run();
@@ -314,7 +337,7 @@ oauth.get("/oauth/github/callback", async (c) => {
   // 账号已有身份时只能用那个身份；还没有时在这一页选定
   const fixed = await accountRole(c.env.DB, accountId);
   const scopes = grantable(request).filter((s) => !fixed || ROLE_SCOPES[fixed].includes(s));
-  const roles = rolesIn(scopes);
+  const roles = rolesOfScopes(scopes);
   if (!roles.length) return failPage(wrongRole(fixed!));
   const clientName = escapeHtml(client?.name ?? "未命名客户端");
   let host = request.redirect_uri;
@@ -372,8 +395,8 @@ oauth.post("/oauth/consent", async (c) => {
   if (actual !== chosen) return failPage(wrongRole(actual));
   const code = `hire_ac_${randomHex(32)}`;
   await c.env.DB.prepare(
-    `INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scopes, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scopes, resource, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       await sha256Hex(code),
@@ -382,6 +405,7 @@ oauth.post("/oauth/consent", async (c) => {
       request.code_challenge,
       request.account_id,
       JSON.stringify(scopes),
+      request.resource ?? resourceUri(origin(c)),
       isoAfter(CODE_TTL),
     )
     .run();
@@ -413,9 +437,11 @@ async function deviceGrant(c: C, form: Record<string, string>) {
   const hash = await sha256Hex(form.device_code ?? "");
   const row = await c.env.DB.prepare("SELECT * FROM device_requests WHERE device_hash = ?")
     .bind(hash)
-    .first<{ github_device_code: string; scopes: string; expires_at: string }>();
+    .first<{ github_device_code: string; scopes: string; resource: string | null; expires_at: string }>();
   const drop = () => c.env.DB.prepare("DELETE FROM device_requests WHERE device_hash = ?").bind(hash).run();
   if (!row) return oauthError(c, "invalid_grant", "device_code 无效。");
+  const resource = row.resource ?? resourceUri(origin(c));
+  if (form.resource !== undefined && form.resource !== resource) return invalidTarget(c);
   if (row.expires_at <= nowIso()) {
     await drop();
     return oauthError(c, "expired_token", "设备码已过期，请重新申请。");
@@ -439,7 +465,7 @@ async function deviceGrant(c: C, form: Record<string, string>) {
   if (role === null || role === "mixed") return oauthError(c, "invalid_scope", "scope 只能包含一种身份的范围。");
   const actual = await claimRole(c.env.DB, accountId, role);
   if (actual !== role) return oauthError(c, "access_denied", wrongRole(actual));
-  const tokens = await issueTokens(c.env.DB, accountId, scopes, null);
+  const tokens = await issueTokens(c.env.DB, accountId, scopes, null, resource);
   return c.json(tokens, 200, { "Cache-Control": "no-store" });
 }
 
@@ -467,6 +493,7 @@ oauth.post("/oauth/token", async (c) => {
         code_challenge: string;
         account_id: string;
         scopes: string;
+        resource: string | null;
         expires_at: string;
       }>();
     if (!row || row.expires_at <= nowIso() || row.client_id !== client.id) {
@@ -479,17 +506,22 @@ oauth.post("/oauth/token", async (c) => {
     if (!form.code_verifier || !safeEqual(challenge, row.code_challenge)) {
       return oauthError(c, "invalid_grant", "code_verifier 校验失败。");
     }
-    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), client.id);
+    const resource = row.resource ?? resourceUri(origin(c));
+    if (form.resource !== undefined && form.resource !== resource) return invalidTarget(c);
+    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), client.id, resource);
     return c.json(tokens, 200, { "Cache-Control": "no-store" });
   }
 
   if (form.grant_type === "refresh_token") {
     const hash = await sha256Hex(form.refresh_token ?? "");
     const existing = await db
-      .prepare("SELECT client_id FROM tokens WHERE refresh_hash = ? AND revoked = 0")
+      .prepare("SELECT client_id, resource FROM tokens WHERE refresh_hash = ? AND revoked = 0")
       .bind(hash)
-      .first<{ client_id: string | null }>();
+      .first<{ client_id: string | null; resource: string | null }>();
     if (!existing) return oauthError(c, "invalid_grant", "刷新令牌无效或已用过。请重新登录。");
+    // 刷新不能换受众。旧令牌没有受众，按默认资源算
+    const resource = existing.resource ?? resourceUri(origin(c));
+    if (form.resource !== undefined && form.resource !== resource) return invalidTarget(c);
     if (existing.client_id) {
       const client = await checkClient(c, form);
       if (client instanceof Response) return client;
@@ -503,7 +535,7 @@ oauth.post("/oauth/token", async (c) => {
     if (!row || row.refresh_expires_at <= nowIso()) {
       return oauthError(c, "invalid_grant", "刷新令牌无效或已过期。请重新登录。");
     }
-    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), row.client_id);
+    const tokens = await issueTokens(db, row.account_id, parseScopes(parseJson<string[]>(row.scopes, [])), row.client_id, resource);
     return c.json(tokens, 200, { "Cache-Control": "no-store" });
   }
 
@@ -513,14 +545,13 @@ oauth.post("/oauth/token", async (c) => {
 // 设备码：给命令行和技能包用。必须说明要哪些范围
 oauth.post("/oauth/device/code", async (c) => {
   const form = await body(c);
-  const scopes = parseScopes(form.scope ?? "");
-  if (roleOfScopes(scopes) === null || roleOfScopes(scopes) === "mixed") {
-    return oauthError(
-      c,
-      "invalid_scope",
-      `scope 必填，用空格分隔，只能包含一种身份的范围。求职者用 "${ROLE_SCOPES.candidate.join(" ")}"，招聘者用 "${ROLE_SCOPES.recruiter.join(" ")}"。`,
-    );
+  const scopes = requestedScopes(form.scope) ?? [];
+  const role = roleOfScopes(scopes);
+  if (role === null || role === "mixed") {
+    return oauthError(c, "invalid_scope", `scope 必填，用空格分隔，只能包含一种身份的范围。${SCOPE_HINT}`);
   }
+  const resource = target(c, form.resource);
+  if (!resource) return invalidTarget(c);
   let started;
   try {
     started = await startDevice(c.env);
@@ -531,9 +562,17 @@ oauth.post("/oauth/device/code", async (c) => {
   if (!started) return oauthError(c, "server_error", "向 GitHub 申请设备码失败。确认 GitHub 应用已开启 Device Flow。", 503);
   const deviceCode = `hire_dc_${randomHex(32)}`;
   await c.env.DB.prepare(
-    "INSERT INTO device_requests (device_hash, github_device_code, scopes, poll_interval, expires_at) VALUES (?, ?, ?, ?, ?)",
+    `INSERT INTO device_requests (device_hash, github_device_code, scopes, poll_interval, resource, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   )
-    .bind(await sha256Hex(deviceCode), started.device_code, JSON.stringify(scopes), started.interval, isoAfter(started.expires_in))
+    .bind(
+      await sha256Hex(deviceCode),
+      started.device_code,
+      JSON.stringify(scopes),
+      started.interval,
+      resource,
+      isoAfter(started.expires_in),
+    )
     .run();
   return c.json(
     {
@@ -565,10 +604,12 @@ oauth.post("/oauth/dev/token", async (c) => {
   const digest = await sha256Hex(`dev:${login.toLowerCase()}`);
   const accountId = await upsertAccount(c.env.DB, -Number.parseInt(digest.slice(0, 12), 16), login);
   const existing = await accountRole(c.env.DB, accountId);
-  const scopes = form.scope ? parseScopes(form.scope) : existing ? ROLE_SCOPES[existing] : [];
+  const scopes = form.scope ? (requestedScopes(form.scope) ?? []) : existing ? ROLE_SCOPES[existing] : [];
   const role = roleOfScopes(scopes);
   if (role === null || role === "mixed") return oauthError(c, "invalid_scope", "scope 只能包含一种身份的范围。");
   const actual = await claimRole(c.env.DB, accountId, role);
   if (actual !== role) return oauthError(c, "access_denied", wrongRole(actual));
-  return c.json(await issueTokens(c.env.DB, accountId, scopes, null), 200, { "Cache-Control": "no-store" });
+  return c.json(await issueTokens(c.env.DB, accountId, scopes, null, resourceUri(origin(c))), 200, {
+    "Cache-Control": "no-store",
+  });
 });

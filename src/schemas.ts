@@ -1,4 +1,5 @@
-import { z } from "zod";
+import * as z from "zod";
+import zhCN from "zod/v4/locales/zh-CN.js";
 import { invalid, type FieldIssue } from "./errors";
 import {
   APPLICATION_STATUSES,
@@ -14,10 +15,9 @@ import {
   REJECT_REASONS,
   SALARY_UNITS,
   keysOf,
-  type RecruitType,
 } from "./taxonomy";
 
-z.config(z.locales.zhCN());
+z.config(zhCN());
 
 const str = (max: number) => z.string().trim().min(1).max(max);
 const httpUrl = z
@@ -26,18 +26,17 @@ const httpUrl = z
   .describe("http 或 https 地址");
 /** 薪资上限。挡住乱填的天文数字 */
 const MAX_SALARY = 10_000_000;
-const salary = () => z.int().min(0).max(MAX_SALARY);
+const salary = z.int().min(0).max(MAX_SALARY);
 const month = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "格式为 YYYY-MM");
 const id = (what: string) => z.string().min(1).max(64).describe(`${what}编号`);
 
-export const RecruitTypeEnum = z.enum(keysOf(RECRUIT_TYPES)).describe(`招聘类型：${ENUM_DOCS.recruit_type}`);
-export const CategoryEnum = z.enum(CATEGORIES).describe("职类，写成“一级.二级”，从枚举里选最接近的");
-export const ExperienceEnum = z.enum(keysOf(EXPERIENCES)).describe(`经验要求：${ENUM_DOCS.experience}`);
-export const DegreeEnum = z.enum(keysOf(DEGREES)).describe(`学历：${ENUM_DOCS.degree}`);
-export const SalaryUnitEnum = z.enum(keysOf(SALARY_UNITS)).describe(`薪资单位：${ENUM_DOCS.salary_unit}`);
-export const StatusEnum = z.enum(keysOf(APPLICATION_STATUSES)).describe(`投递状态：${ENUM_DOCS.status}`);
-const PersonDegreeEnum = z
-  .enum(["junior_high", "secondary", "high", "college", "bachelor", "master", "doctor"])
+const RecruitTypeEnum = z.enum(keysOf(RECRUIT_TYPES)).describe(`招聘类型：${ENUM_DOCS.recruit_type}`);
+const CategoryEnum = z.enum(CATEGORIES).describe("职类，写成“一级.二级”，从枚举里选最接近的");
+const ExperienceEnum = z.enum(keysOf(EXPERIENCES)).describe(`经验要求：${ENUM_DOCS.experience}`);
+const DegreeEnum = z.enum(keysOf(DEGREES)).describe(`学历：${ENUM_DOCS.degree}`);
+const SalaryUnitEnum = z.enum(keysOf(SALARY_UNITS)).describe(`薪资单位：${ENUM_DOCS.salary_unit}`);
+const StatusEnum = z.enum(keysOf(APPLICATION_STATUSES)).describe(`投递状态：${ENUM_DOCS.status}`);
+const PersonDegreeEnum = DegreeEnum.exclude(["any"])
   .describe("在读或已获得的最高学历");
 
 const pageShape = {
@@ -59,7 +58,7 @@ export const CompanyInput = z.strictObject({
 
 // ---------- 岗位 ----------
 
-const jobShape = {
+export const JobFields = z.strictObject({
   title: str(60).describe("岗位名称，60 字以内"),
   recruit_type: RecruitTypeEnum,
   category: CategoryEnum,
@@ -68,8 +67,8 @@ const jobShape = {
   experience: ExperienceEnum,
   degree: DegreeEnum.describe(`最低学历要求：${ENUM_DOCS.degree}`),
   grad_years: z.array(z.int().min(2000).max(2100)).max(6).optional().describe("面向届别，如 [2027, 2028]"),
-  salary_min: salary().nullable().optional().describe("薪资下限。不面议时必填"),
-  salary_max: salary().nullable().optional().describe("薪资上限。不面议时必填"),
+  salary_min: salary.nullable().optional().describe("薪资下限。不面议时必填"),
+  salary_max: salary.nullable().optional().describe("薪资上限。不面议时必填"),
   salary_unit: SalaryUnitEnum.nullable().optional(),
   salary_negotiable: z.boolean().optional().describe("是否面议，默认 false"),
   days_per_week: z.int().min(1).max(7).nullable().optional().describe("每周到岗天数。实习岗位必填，其他类型不要传"),
@@ -97,9 +96,7 @@ const jobShape = {
     .max(3)
     .optional()
     .describe("筛选问题，最多 3 个。求职者投递时必须逐个回答"),
-};
-
-export const JobFields = z.strictObject(jobShape);
+});
 export type JobFields = z.infer<typeof JobFields>;
 
 export const JobCreateInput = JobFields.extend({
@@ -114,7 +111,7 @@ export const JobUpdateInput = JobFields.partial().extend({
 /** 跨字段校验，创建和更新后的完整岗位都要过一遍。 */
 export function checkJob(job: JobFields): void {
   const issues: FieldIssue[] = [];
-  const intern = INTERN_TYPES.includes(job.recruit_type as RecruitType);
+  const intern = INTERN_TYPES.includes(job.recruit_type);
   if (intern) {
     if (job.days_per_week == null) issues.push({ field: "days_per_week", message: "实习岗位必须填每周到岗天数。" });
     if (job.min_months == null) issues.push({ field: "min_months", message: "实习岗位必须填最短实习月数。" });
@@ -140,7 +137,7 @@ export function checkJob(job: JobFields): void {
   if (issues.length) throw invalid(issues);
 }
 
-const jobFilterShape = {
+export const JobFilters = z.strictObject({
   q: z.string().trim().max(100).optional().describe("关键词，空格分隔表示都要包含"),
   recruit_type: RecruitTypeEnum.optional(),
   category: z
@@ -153,18 +150,15 @@ const jobFilterShape = {
   grad_year: z.int().min(2000).max(2100).optional().describe("你的毕业年份。只返回面向这一届或不限届别的岗位"),
   days_per_week_max: z.int().min(1).max(7).optional().describe("你每周最多能到岗几天"),
   min_months_max: z.int().min(1).max(24).optional().describe("你最多能实习几个月"),
-  salary_min: salary().optional().describe("期望的最低薪资，必须和 salary_unit 一起传。只匹配同一单位、上限不低于它的岗位"),
+  salary_min: salary.optional().describe("期望的最低薪资，必须和 salary_unit 一起传。只匹配同一单位、上限不低于它的岗位"),
   salary_unit: SalaryUnitEnum.optional(),
   skills: z.array(str(30)).max(10).optional().describe("技能标签，命中任意一个即可"),
   company_id: id("公司").optional(),
   active_within_days: z.int().min(1).max(90).optional().describe("只返回招聘者最近这么多天内活跃过的岗位"),
-};
-
-export const JobFilters = z.strictObject(jobFilterShape);
+});
 export type JobFilters = z.infer<typeof JobFilters>;
 
-export const JobsSearchInput = z.strictObject({
-  ...jobFilterShape,
+export const JobsSearchInput = JobFilters.extend({
   mine: z.boolean().optional().describe("招聘者专用：true 表示列出自己名下所有状态的岗位"),
   ...pageShape,
 });
@@ -200,7 +194,7 @@ const projectItem = z.strictObject({
   link: httpUrl.optional(),
 });
 
-const resumeShape = {
+const ResumeContent = z.strictObject({
   name: str(30).describe("姓名"),
   school: str(50).describe("学校"),
   degree: PersonDegreeEnum,
@@ -213,10 +207,8 @@ const resumeShape = {
   experience: z.array(experienceItem).max(20).describe("工作和实习经历"),
   projects: z.array(projectItem).max(20),
   links: z.array(httpUrl).max(10).describe("GitHub、个人网站等链接"),
-};
-
-export const ResumeContent = z.strictObject(resumeShape).partial();
-export type ResumeContent = z.infer<typeof ResumeContent>;
+}).partial();
+type ResumeContent = z.infer<typeof ResumeContent>;
 
 /** 经历的结束时间不能早于开始时间。 */
 export function checkResume(content: ResumeContent, prefix = ""): void {
@@ -231,11 +223,11 @@ export function checkResume(content: ResumeContent, prefix = ""): void {
   if (issues.length) throw invalid(issues);
 }
 
-export const Expectation = z.strictObject({
+const Expectation = z.strictObject({
   recruit_types: z.array(RecruitTypeEnum).max(5).optional().describe("想找的招聘类型"),
   cities: z.array(str(20)).max(10).optional().describe("期望城市"),
   days_per_week: z.int().min(1).max(7).optional().describe("每周能到岗几天"),
-  salary_min: salary().optional(),
+  salary_min: salary.optional(),
   salary_unit: SalaryUnitEnum.optional(),
   available_from: z.iso.date().optional().describe("最早到岗日期，YYYY-MM-DD"),
   duration_months: z.int().min(1).max(36).optional().describe("能实习几个月"),
@@ -309,7 +301,7 @@ export const ApplicationRejectInput = z.strictObject({
 export const OfferCreateInput = z.strictObject({
   application_id: id("投递"),
   start_date: z.iso.date().optional().describe("入职日期，YYYY-MM-DD"),
-  salary: salary().optional().describe("录用薪资，必须和 salary_unit 一起传"),
+  salary: salary.optional().describe("录用薪资，必须和 salary_unit 一起传"),
   salary_unit: SalaryUnitEnum.optional(),
   reply_by: z.iso.date().optional().describe("答复期限，YYYY-MM-DD。过了这一天对方不能再接受"),
   note,
@@ -356,7 +348,7 @@ export const QuotaGetInput = z.strictObject({
   job_id: id("岗位").optional().describe("招聘者传它可以看这个岗位今天还能主动邀约几次"),
 });
 
-export function zodIssues(error: z.ZodError): FieldIssue[] {
+function zodIssues(error: z.ZodError): FieldIssue[] {
   return error.issues.map((issue) => ({
     field: issue.path.join(".") || "(整体)",
     message: issue.message,

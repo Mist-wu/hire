@@ -1,4 +1,4 @@
-import { HireError } from "./errors";
+import { invalid } from "./errors";
 import { decodeCursor, encodeCursor } from "./util";
 
 export interface Where {
@@ -27,9 +27,7 @@ export function addCursor(where: Where, cursor: string | undefined, timeCol: str
   if (!cursor) return;
   const decoded = decodeCursor(cursor);
   if (!decoded || typeof decoded[0] !== "string" || typeof decoded[1] !== "string") {
-    throw new HireError("validation_failed", "cursor 无效，请用上一页返回的 next_cursor。", {
-      fields: [{ field: "cursor", message: "无效" }],
-    });
+    throw invalid([{ field: "cursor", message: "无效" }], "cursor 无效，请用上一页返回的 next_cursor。");
   }
   where.clauses.push(`(${timeCol} < ? OR (${timeCol} = ? AND ${idCol} < ?))`);
   where.params.push(decoded[0], decoded[0], decoded[1]);

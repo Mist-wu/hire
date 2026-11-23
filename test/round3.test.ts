@@ -69,7 +69,12 @@ describe("订阅", () => {
       Array.from({ length: 9 }, (_, i) => api("POST", "/subscriptions", token, { name: `s${i}`, filters: { q: `关键词${i}` } })),
     );
     expect(results.filter((r) => r.status === 200)).toHaveLength(5);
-    expect((await api("GET", "/subscriptions", token)).data.subscriptions).toHaveLength(5);
+    const { subscriptions } = (await api("GET", "/subscriptions", token)).data;
+    expect(subscriptions).toHaveLength(5);
+    const duplicate = await api("POST", "/subscriptions", token, { name: "重复", filters: subscriptions[0].filters });
+    expect(duplicate.data.error.details.fields[0]).toEqual({
+      field: "filters", message: `和已有的订阅“${subscriptions[0].name}”条件相同。`,
+    });
 
     const other = await newSeeker();
     expect((await api("POST", "/subscriptions", other.token, { name: "空", filters: { q: "" } })).status).toBe(422);
@@ -160,6 +165,7 @@ describe("邀约和录用", () => {
     expect(results.filter((r) => r.status === 200)).toHaveLength(1);
     const full = results.find((r) => r.status !== 200)!;
     expect(full.data.error.code).toBe("job_not_open");
+    expect(full.data.error.details.reason).toBe("headcount_reached");
     // 招聘者加了名额之后可以接受
     await api("PATCH", `/jobs/${job.id}`, hr, { headcount: 2 });
     const loser = people[results.findIndex((r) => r.status !== 200)]!;

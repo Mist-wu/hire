@@ -59,9 +59,10 @@ function accountSql(key, githubId, login, role) {
     `INSERT INTO accounts (id, github_id, github_login, role, created_at)
      VALUES (${q(`acc_${randomBytes(10).toString("hex")}`)}, ${githubId}, ${q(login)}, ${q(role)}, ${q(now)})
      ON CONFLICT (github_id) DO UPDATE SET role = COALESCE(accounts.role, excluded.role);`,
-    `INSERT INTO tokens (id, account_id, client_id, scopes, access_hash, access_expires_at, refresh_hash, refresh_expires_at, created_at)
+    `INSERT INTO tokens (id, account_id, client_id, scopes, access_hash, access_expires_at, refresh_hash, refresh_expires_at, created_at,
+       resource)
      SELECT ${q(`tok_seed_${randomBytes(8).toString("hex")}`)}, id, NULL, ${q(ALL_SCOPES)}, ${q(sha(token))}, ${q(expires)},
-            ${q(`seed-${randomBytes(16).toString("hex")}`)}, ${q(now)}, ${q(now)}
+            ${q(`seed-${randomBytes(16).toString("hex")}`)}, ${q(now)}, ${q(now)}, ${q(`${url}/mcp`)}
      FROM accounts WHERE github_id = ${githubId};`,
   ];
 }

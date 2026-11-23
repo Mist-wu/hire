@@ -1,16 +1,4 @@
-export type ErrorCode =
-  | "unauthorized"
-  | "forbidden_scope"
-  | "not_found"
-  | "validation_failed"
-  | "invalid_transition"
-  | "duplicate_application"
-  | "quota_exceeded"
-  | "job_not_open"
-  | "not_configured"
-  | "internal";
-
-const STATUS: Record<ErrorCode, number> = {
+const STATUS = {
   unauthorized: 401,
   forbidden_scope: 403,
   not_found: 404,
@@ -21,17 +9,17 @@ const STATUS: Record<ErrorCode, number> = {
   job_not_open: 409,
   not_configured: 503,
   internal: 500,
-};
+} as const;
 
 export class HireError extends Error {
   constructor(
-    public code: ErrorCode,
+    public code: keyof typeof STATUS,
     message: string,
     public details?: Record<string, unknown>,
   ) {
     super(message);
   }
-  get status(): number {
+  get status() {
     return STATUS[this.code];
   }
   toJSON() {

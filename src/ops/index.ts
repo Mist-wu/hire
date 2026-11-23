@@ -1,51 +1,23 @@
 import type { Auth, Ctx } from "../env";
 import { HireError } from "../errors";
 import type { Op } from "../registry";
-import { applicationOps } from "./applications";
-import { candidateOps } from "./candidates";
-import { jobOps } from "./jobs";
+import { candidateApplicationOps, recruiterApplicationOps, sharedApplicationOps } from "./applications";
+import { candidateSearchOps, profileOps } from "./candidates";
+import { publicJobOps, recruiterJobOps } from "./jobs";
 import { subscriptionOps } from "./subscriptions";
 
-const ORDER = [
-  "profile_get",
-  "profile_update",
-  "resume_upload",
-  "profile_delete",
-  "jobs_search",
-  "job_get",
-  "subscription_create",
-  "subscriptions_list",
-  "subscription_delete",
-  "application_create",
-  "applications_list",
-  "application_withdraw",
-  "invitation_respond",
-  "offer_respond",
-  "company_get",
-  "company_upsert",
-  "job_create",
-  "job_update",
-  "job_close",
-  "job_stats",
-  "candidates_search",
-  "candidate_get",
-  "job_applications_list",
-  "invitation_create",
-  "offer_create",
-  "application_reject",
-  "application_get",
-  "events_poll",
-  "quota_get",
+export const OPS: Op[] = [
+  ...profileOps,
+  ...publicJobOps,
+  ...subscriptionOps,
+  ...candidateApplicationOps,
+  ...recruiterJobOps,
+  ...candidateSearchOps,
+  ...recruiterApplicationOps,
+  ...sharedApplicationOps,
 ];
 
-const all = [...candidateOps, ...jobOps, ...subscriptionOps, ...applicationOps];
-export const OPS: Op[] = ORDER.map((name) => {
-  const found = all.find((op) => op.name === name);
-  if (!found) throw new Error(`missing op ${name}`);
-  return found;
-});
-
-export function allowed(op: Op, auth: Auth): boolean {
+function allowed(op: Op, auth: Auth): boolean {
   return op.scopes.length === 0 || op.scopes.some((s) => auth.scopes.has(s));
 }
 

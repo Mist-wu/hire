@@ -15,13 +15,18 @@ interface SubRow {
   name: string;
   filters: string;
   cursor_at: string;
+  cursor_job_id: string;
   created_at: string;
 }
 
-/** 存之前先归一化：去掉空值，城市别名统一，技能去重排序。这样换个写法的相同条件能认出来。 */
-function normalizeFilters(input: JobFilters): JobFilters {
+/**
+ * 存之前先归一化：去掉空值，城市别名统一，技能去重排序，键名排序。
+ * 这样换个写法的相同条件存下来是同一个字符串，唯一索引能认出来。
+ */
+function normalizeFilters(input: JobFilters): string {
   const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input)) {
+  for (const key of Object.keys(input).sort()) {
+    const value = (input as Record<string, unknown>)[key];
     if (value === undefined || value === "") continue;
     if (key === "city") out[key] = normCity(value as string);
     else if (key === "skills") {
@@ -29,12 +34,7 @@ function normalizeFilters(input: JobFilters): JobFilters {
       if (skills.length) out[key] = skills;
     } else out[key] = value;
   }
-  return out as JobFilters;
-}
-
-function sameFilters(a: object, b: object): boolean {
-  const norm = (o: object) => JSON.stringify(Object.entries(o).sort(([x], [y]) => x.localeCompare(y)));
-  return norm(a) === norm(b);
+  return JSON.stringify(out);
 }
 
 function toApi(row: SubRow) {
@@ -43,8 +43,9 @@ function toApi(row: SubRow) {
 
 /**
  * 把订阅创建之后新开放、又符合条件的岗位写成事件。在拉取事件时才算，
- * 所以发布岗位不用遍历所有人的订阅。cursor_at 记着算到哪了，也用来防止并发时重复写。
- * 同一个岗位只通知一次，哪怕命中了几个订阅。返回值表示还有没推完的，调用方应该再拉一次。
+ * 所以发布岗位不用遍历所有人的订阅。游标 (cursor_at, cursor_job_id) 记着算到哪了，也用来防止并发时重复写。
+ * 同一个岗位只通知一次，哪怕命中了几个订阅：推过的记在 job_notifications 里。
+ * 返回值表示还有没推完的，调用方应该再拉一次。
  */
 export async function deliverMatches(ctx: Ctx): Promise<boolean> {
   let more = false;
@@ -54,7 +55,10 @@ export async function deliverMatches(ctx: Ctx): Promise<boolean> {
     .all<SubRow>();
   for (const sub of subs) {
     // 按最近一次开放的时间算：暂停后重开的岗位也能补上
-    const where: Where = { clauses: ["j.opened_at > ?"], params: [sub.cursor_at] };
+    const where: Where = {
+      clauses: ["(j.opened_at > ? OR (j.opened_at = ? AND j.id > ?))"],
+      params: [sub.cursor_at, sub.cursor_at, sub.cursor_job_id],
+    };
     addOpenFilter(where);
     addJobFilters(where, parseJson<JobFilters>(sub.filters, {}));
     const { results: jobs } = await ctx.db
@@ -68,15 +72,16 @@ export async function deliverMatches(ctx: Ctx): Promise<boolean> {
     if (!jobs.length) continue;
     if (jobs.length === MATCHES_PER_POLL) more = true;
     const now = nowIso();
-    const guard = `WHERE EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND cursor_at = ?)
-      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.account_id = ? AND e.type = 'job.matched'
-                      AND json_extract(e.payload, '$.job_id') = ?)`;
+    const last = jobs[jobs.length - 1]!;
+    const current = "EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND cursor_at = ? AND cursor_job_id = ?)";
+    const cursor = [sub.id, sub.cursor_at, sub.cursor_job_id];
     await ctx.db.batch([
-      ...jobs.map((job) =>
+      ...jobs.flatMap((job) => [
         ctx.db
           .prepare(
             `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
-             SELECT ?, 'candidate', 'job.matched', NULL, ?, ? ${guard}`,
+             SELECT ?, 'candidate', 'job.matched', NULL, ?, ? WHERE ${current}
+               AND NOT EXISTS (SELECT 1 FROM job_notifications WHERE account_id = ? AND job_id = ?)`,
           )
           .bind(
             sub.account_id,
@@ -88,15 +93,17 @@ export async function deliverMatches(ctx: Ctx): Promise<boolean> {
               subscription_name: sub.name,
             }),
             now,
-            sub.id,
-            sub.cursor_at,
+            ...cursor,
             sub.account_id,
             job.id,
           ),
-      ),
+        ctx.db
+          .prepare(`INSERT OR IGNORE INTO job_notifications (account_id, job_id, created_at) SELECT ?, ?, ? WHERE ${current}`)
+          .bind(sub.account_id, job.id, now, ...cursor),
+      ]),
       ctx.db
-        .prepare("UPDATE subscriptions SET cursor_at = ? WHERE id = ? AND cursor_at = ?")
-        .bind(jobs[jobs.length - 1]!.opened_at, sub.id, sub.cursor_at),
+        .prepare("UPDATE subscriptions SET cursor_at = ?, cursor_job_id = ? WHERE id = ? AND cursor_at = ? AND cursor_job_id = ?")
+        .bind(last.opened_at, last.id, ...cursor),
     ]);
   }
   return more;
@@ -115,45 +122,33 @@ export const subscriptionOps = [
     input: SubscriptionCreateInput,
     handler: async (ctx, input) => {
       const filters = normalizeFilters(input.filters);
-      if (!Object.keys(filters).length) {
+      if (filters === "{}") {
         throw invalid([{ field: "filters", message: "至少传一个搜索条件。" }]);
       }
       checkSalaryPair(input.filters);
-      const { results: existing } = await ctx.db
-        .prepare("SELECT * FROM subscriptions WHERE account_id = ?")
-        .bind(ctx.auth.accountId)
-        .all<SubRow>();
-      const same = existing.find((row) => sameFilters(parseJson<JobFilters>(row.filters, {}), filters));
+      const now = nowIso();
+      const row = await ctx.db
+        .prepare(
+          `INSERT INTO subscriptions (id, account_id, name, filters, cursor_at, created_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?5
+           WHERE (SELECT COUNT(*) FROM subscriptions WHERE account_id = ?2) < ?6
+           ON CONFLICT (account_id, filters) DO NOTHING RETURNING *`,
+        )
+        .bind(newId("sub"), ctx.auth.accountId, input.name, filters, now, MAX_SUBSCRIPTIONS)
+        .first<SubRow>();
+      if (row) return { subscription: toApi(row) };
+
+      const same = await ctx.db
+        .prepare("SELECT name FROM subscriptions WHERE account_id = ? AND filters = ?")
+        .bind(ctx.auth.accountId, filters)
+        .first<{ name: string }>();
       if (same) {
-        throw invalid(
-          [{ field: "filters", message: `和已有的订阅“${same.name}”条件相同。` }],
-          "已经有一个条件相同的订阅，不用再建。",
-        );
+        throw invalid([{ field: "filters", message: `和已有的订阅“${same.name}”条件相同。` }], "已经有一个条件相同的订阅，不用再建。");
       }
-      const full = invalid(
+      throw invalid(
         [{ field: "name", message: `最多 ${MAX_SUBSCRIPTIONS} 个订阅。` }],
         `订阅已达上限 ${MAX_SUBSCRIPTIONS} 个。先用 subscription_delete 删掉一个。`,
       );
-      if (existing.length >= MAX_SUBSCRIPTIONS) throw full;
-      const row: SubRow = {
-        id: newId("sub"),
-        account_id: ctx.auth.accountId,
-        name: input.name,
-        filters: JSON.stringify(filters),
-        cursor_at: nowIso(),
-        created_at: nowIso(),
-      };
-      // 上限写在插入语句里，并发创建也挤不过去
-      const result = await ctx.db
-        .prepare(
-          `INSERT INTO subscriptions (id, account_id, name, filters, cursor_at, created_at)
-           SELECT ?1, ?2, ?3, ?4, ?5, ?6
-           WHERE (SELECT COUNT(*) FROM subscriptions WHERE account_id = ?2) < ?7`,
-        )
-        .bind(row.id, row.account_id, row.name, row.filters, row.cursor_at, row.created_at, MAX_SUBSCRIPTIONS)
-        .run();
-      if (!result.meta.changes) throw full;
-      return { subscription: toApi(row) };
     },
   }),
 

@@ -3,12 +3,11 @@ import { cors } from "hono/cors";
 import { oauth } from "./auth/oauth";
 import type { Env } from "./env";
 import { HireError } from "./errors";
-import { handleMcp, unauthorized } from "./mcp";
+import { handleMcp } from "./mcp";
 import { openapi } from "./openapi";
 import { OPS } from "./ops";
-import { expireStale, resumePdfForApplication } from "./ops/applications";
-import { loadCandidate } from "./ops/candidates";
-import { makeCtx, mountRest } from "./rest";
+import { expireStale } from "./ops/applications";
+import { mountRest } from "./rest";
 import { nowIso } from "./util";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -35,8 +34,11 @@ for (const path of ["/v1/*", "/mcp", "/.well-known/*", "/oauth/token", "/oauth/r
 
 app.onError((err, c) => {
   if (err instanceof HireError) {
-    if (err.code === "unauthorized") return unauthorized(c, err);
-    return c.json(err.toJSON(), err.status as 400);
+    if (err.code === "unauthorized") {
+      const origin = new URL(c.req.url).origin;
+      c.header("WWW-Authenticate", `Bearer realm="hire", resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`);
+    }
+    return c.json(err.toJSON(), err.status);
   }
   console.error("unhandled", err);
   return c.json(new HireError("internal", "服务端出错了。稍后再试一次。").toJSON(), 500);
@@ -62,41 +64,9 @@ app.get("/v1/openapi.json", (c) => c.json(openapi(new URL(c.req.url).origin)));
 
 app.route("/", oauth);
 
-async function sendPdf(env: Env, key: string, filename: string): Promise<Response> {
-  const object = await env.FILES.get(key);
-  if (!object) throw new HireError("not_found", "找不到这份 PDF。");
-  return new Response(object.body, {
-    headers: {
-      "Content-Type": "application/pdf",
-      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
-      "Cache-Control": "private, no-store",
-    },
-  });
-}
-
-// 两个下载地址只有 REST，没有对应的 MCP 工具
-app.get("/v1/me/resume/pdf", async (c) => {
-  const ctx = await makeCtx(c);
-  if (!ctx.auth.scopes.has("candidate:read")) {
-    throw new HireError("forbidden_scope", "需要 candidate:read 范围。", { required: ["candidate:read"] });
-  }
-  const row = await loadCandidate(ctx.db, ctx.auth.accountId);
-  if (!row?.pdf_key) throw new HireError("not_found", "你还没有上传过 PDF 简历。");
-  return sendPdf(c.env, row.pdf_key, row.pdf_name ?? "resume.pdf");
-});
-
-app.get("/v1/applications/:application_id/resume.pdf", async (c) => {
-  const ctx = await makeCtx(c);
-  if (!ctx.auth.scopes.has("recruiter:read")) {
-    throw new HireError("forbidden_scope", "需要 recruiter:read 范围。", { required: ["recruiter:read"] });
-  }
-  const { key, filename } = await resumePdfForApplication(ctx, c.req.param("application_id"));
-  return sendPdf(c.env, key, filename);
-});
-
 mountRest(app);
 
-app.all("/mcp", (c) => handleMcp(c));
+app.all("/mcp", handleMcp);
 
 async function cleanup(env: Env): Promise<void> {
   const now = nowIso();

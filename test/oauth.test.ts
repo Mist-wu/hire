@@ -1,6 +1,8 @@
-import { SELF } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BASE, api } from "./helpers";
+import { BASE, CANDIDATE, api, login, mcp, unique } from "./helpers";
+
+const db = (env as any).DB as D1Database;
 
 const REDIRECT = "http://127.0.0.1:53111/callback";
 
@@ -245,4 +247,95 @@ describe("OAuth", () => {
     expect((await api("GET", "/company", issued.data.access_token)).status).toBe(200);
     expect((await token(grant)).data.error).toBe("invalid_grant");
   });
+
+  it("令牌绑定资源：不认识的 resource 报 invalid_target，刷新不能换受众", async () => {
+    mockGithub({ id: 4848, login: "bound" });
+    const client = (await register()).data;
+    const { verifier, challenge } = await pkce();
+    const other = encodeURIComponent("https://other.example/mcp");
+    const bad = await startAuthorize(client.client_id, challenge, `&resource=${other}`);
+    expect(bad.location.searchParams.get("error")).toBe("invalid_target");
+
+    const codeFor = async () => {
+      const start = await startAuthorize(client.client_id, challenge, `&resource=${encodeURIComponent(`${BASE}/mcp`)}`);
+      return (await consent(start.requestId, start.cookie, "approve", ["candidate"])).location.searchParams.get("code")!;
+    };
+    const exchange = (code: string, extra: Record<string, string> = {}) =>
+      token({ grant_type: "authorization_code", code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier, ...extra });
+    expect((await exchange(await codeFor(), { resource: "https://other.example/mcp" })).data.error).toBe("invalid_target");
+    const issued = await exchange(await codeFor(), { resource: `${BASE}/mcp` });
+    expect(issued.status).toBe(200);
+    const row = await db.prepare("SELECT resource FROM tokens WHERE access_hash = ?").bind(await sha256(issued.data.access_token)).first();
+    expect(row).toEqual({ resource: `${BASE}/mcp` });
+
+    const refresh = (extra: Record<string, string> = {}) =>
+      token({ grant_type: "refresh_token", refresh_token: issued.data.refresh_token, client_id: client.client_id, ...extra });
+    expect((await refresh({ resource: "https://other.example/mcp" })).data.error).toBe("invalid_target");
+    expect((await refresh()).status).toBe(200);
+
+    const started = await SELF.fetch(`${BASE}/oauth/device/code`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: CANDIDATE, resource: "https://other.example/mcp" }),
+    });
+    expect((await started.json<any>()).error).toBe("invalid_target");
+  });
+
+  it("旧令牌没有受众照样能用；发给别的资源的令牌在 /v1 和 /mcp 都不能用", async () => {
+    const access = await login(unique("aud"), CANDIDATE);
+    const hash = await sha256(access);
+    // 测试登录（seed 也走这条路）签发的令牌绑定默认资源
+    expect(await db.prepare("SELECT resource FROM tokens WHERE access_hash = ?").bind(hash).first()).toEqual({ resource: `${BASE}/mcp` });
+    const setResource = (value: string | null) => db.prepare("UPDATE tokens SET resource = ? WHERE access_hash = ?").bind(value, hash).run();
+
+    await setResource(null);
+    expect((await api("GET", "/me/profile", access)).status).toBe(200);
+    expect((await mcp(access, "tools/list")).status).toBe(200);
+    await setResource("https://other.example/mcp");
+    expect((await api("GET", "/me/profile", access)).status).toBe(401);
+    expect((await mcp(access, "tools/list")).status).toBe(401);
+  });
+
+  it("显式传了不认识的 scope 就报错，不当作没传", async () => {
+    const client = (await register()).data;
+    const { challenge } = await pkce();
+    for (const scope of ["bogus", "candidate:read bogus"]) {
+      const start = await startAuthorize(client.client_id, challenge, `&scope=${encodeURIComponent(scope)}`);
+      expect(start.location.searchParams.get("error")).toBe("invalid_scope");
+    }
+    const device = await SELF.fetch(`${BASE}/oauth/device/code`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "candidate:read bogus" }),
+    });
+    expect((await device.json<any>()).error).toBe("invalid_scope");
+  });
+
+  it("只登记了一个回调地址时可以不传 redirect_uri", async () => {
+    mockGithub({ id: 4949, login: "omit" });
+    const authorize = (clientId: string, challenge: string, redirect?: string) =>
+      SELF.fetch(
+        `${BASE}/oauth/authorize?response_type=code&client_id=${clientId}&code_challenge=${challenge}&code_challenge_method=S256&state=s` +
+          (redirect === undefined ? "" : `&redirect_uri=${encodeURIComponent(redirect)}`),
+        { redirect: "manual" },
+      );
+    const single = (await register()).data;
+    const { challenge } = await pkce();
+    const res = await authorize(single.client_id, challenge);
+    const location = new URL(res.headers.get("Location")!);
+    expect(location.origin).toBe("https://github.com");
+    const cookie = (res.headers.get("Set-Cookie") ?? "").split(";")[0]!;
+    const done = await consent(location.searchParams.get("state")!, cookie, "approve", ["candidate"]);
+    expect(done.location.origin + done.location.pathname).toBe(REDIRECT);
+
+    expect((await authorize(single.client_id, challenge, "")).status).toBe(400);
+    expect((await authorize(single.client_id, challenge, "https://evil.example/cb")).status).toBe(400);
+    const multi = (await register({ redirect_uris: [REDIRECT, "https://app.example/cb"] })).data;
+    expect((await authorize(multi.client_id, challenge)).status).toBe(400);
+  });
 });
+
+async function sha256(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}

@@ -73,7 +73,7 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 1. 用户选定后，可以针对这个岗位写一份 `custom_resume`：调整简介和项目描述的侧重。只能用资料里已有的事实，不能新增经历。
 2. 岗位的 `questions` 不为空时，把问题逐个问用户，按顺序填进 `answers`。单选题只能填 `options` 里的一项。不要替用户回答。
 3. 把 `custom_resume`、`answers` 和 `note` 给用户看，确认后再调 `application_create`。
-4. 每天最多投 20 次。同一个岗位被拒绝或撤回后 7 天内不能再投。`accepting` 为 `false` 的岗位不能投。
+4. 每天的投递次数有限额，余量用 `quota_get` 查。同一个岗位被拒绝或撤回后 7 天内不能再投。`accepting` 为 `false` 的岗位不能投。
 
 **跟进。**
 
@@ -119,7 +119,7 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 **主动找人。**
 
 1. 用 `candidates_search` 按城市、届别、学历、技能过滤，再用 `candidate_get` 读简历。`my_application` 不为空的人已经联系过。
-2. 合适的用 `invitation_create`，传 `job_id` 和 `candidate_id`。每个岗位每天最多主动邀约 20 人。对方拒绝或撤回后 7 天内不能再邀约。
+2. 合适的用 `invitation_create`，传 `job_id` 和 `candidate_id`。每个岗位每天主动邀约的人数有限额，用 `quota_get` 传 `job_id` 查余量。对方拒绝或撤回后 7 天内不能再邀约。
 3. 对方接受后，`application_get` 的 `contact` 里有手机、邮箱和 PDF 的下载路径。
 
 **岗位招满了**，用 `job_close`。它会结束这个岗位下还没约上面试的投递，不能重新打开。已经约好面试和已发录用的投递不受影响。只是暂时不招，用 `job_update` 把 `status` 改成 `paused`。岗位填了招聘人数时，录用人数到了会自动暂停。
@@ -127,7 +127,6 @@ REST 路径和入参见 `$HIRE/v1/openapi.json`。每个 MCP 工具对应一个 
 ## 轮询
 
 - 有未结束的投递（已投递、已查看、已邀约、已接受、已发录用）或有订阅时，每 10 分钟调一次 `events_poll`。都没有就不用轮询。
-- 每分钟最多 6 次。
 - 事件里只有摘要，投递详情用 `application_get` 取。`job.matched` 没有投递编号，用 `job_get` 取岗位详情。
 
 ## 规矩
