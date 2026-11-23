@@ -55,7 +55,6 @@ interface AppRow {
   updated_at: string;
   job_title: string;
   job_status: string;
-  company_id: string;
   company_name: string;
   company_contact_email: string | null;
   owner_account_id: string;
@@ -104,7 +103,7 @@ function checkAnswers(questions: Question[], answers: string[] | undefined): Ans
 }
 
 const APP_SELECT = `
-  SELECT a.*, j.title AS job_title, j.status AS job_status, c.id AS company_id, c.name AS company_name,
+  SELECT a.*, j.title AS job_title, j.status AS job_status, c.name AS company_name,
          c.contact_email AS company_contact_email, c.owner_account_id, cand.name AS candidate_name
   FROM applications a
   JOIN jobs j ON j.id = a.job_id
@@ -391,13 +390,13 @@ async function detail(ctx: Ctx, app: AppRow, side: Role) {
     closed_by: app.closed_by,
     ended_at: app.ended_at,
     viewing_as: side,
+    custom_resume: parseJson<unknown>(app.custom_resume, null),
     logs,
   };
   const accepted = CONTACT_STATUSES.includes(app.status);
   if (side === "candidate") {
     return {
       ...base,
-      custom_resume: parseJson<unknown>(app.custom_resume, null),
       contact: accepted ? { company_email: app.company_contact_email } : null,
     };
   }
@@ -405,7 +404,6 @@ async function detail(ctx: Ctx, app: AppRow, side: Role) {
   return {
     ...base,
     candidate: candidate ? candidatePublic(candidate) : null,
-    custom_resume: parseJson<unknown>(app.custom_resume, null),
     contact:
       accepted && candidate
         ? {
@@ -428,7 +426,7 @@ async function listApps(ctx: Ctx, where: Where, input: { cursor?: string; limit?
   return { applications: page.map(summary), next_cursor };
 }
 
-export const applicationOps = [
+export const candidateApplicationOps = [
   defineOp({
     name: "application_create",
     title: "投递岗位",
@@ -501,57 +499,6 @@ export const applicationOps = [
   }),
 
   defineOp({
-    name: "job_applications_list",
-    title: "查看岗位收到的投递",
-    description:
-      "招聘者列出自己某个岗位下的全部投递，按更新时间从新到旧排列。这里只有摘要，不会把投递标成“已查看”。要看简历全文请调用 application_get。",
-    method: "GET",
-    path: "/jobs/:job_id/applications",
-    scopes: ["recruiter:read"],
-    readOnly: true,
-    input: JobApplicationsListInput,
-    handler: async (ctx, input) => {
-      await loadJob(ctx.db, input.job_id, ctx.auth.accountId);
-      const where: Where = { clauses: ["a.job_id = ?"], params: [input.job_id] };
-      if (input.status) {
-        where.clauses.push("a.status = ?");
-        where.params.push(input.status);
-      }
-      return listApps(ctx, where, input);
-    },
-  }),
-
-  defineOp({
-    name: "application_get",
-    title: "查看投递详情",
-    description:
-      "查看一条投递的全部信息：状态、邀约内容、筛选问题的回答、录用内容、每一步的备注记录。招聘者还能看到求职者的简历和这次投递附带的 custom_resume；招聘者第一次查看时，投递会从“已投递”变成“已查看”，求职者会收到通知。状态是“已接受”“已发录用”“已录用”时，contact 字段里才有对方的联系方式。",
-    method: "GET",
-    path: "/applications/:application_id",
-    scopes: ["candidate:read", "recruiter:read"],
-    readOnly: false,
-    readOnlyFor: ["candidate"],
-    idempotent: true,
-    input: ApplicationGetInput,
-    handler: async (ctx, input) => {
-      let app = await loadApp(ctx.db, input.application_id);
-      const side = sideOf(ctx, app);
-      if (side === "recruiter" && app.status === "applied") {
-        try {
-          await transition(ctx.db, app, ["applied"], "viewed", {
-            actor: "recruiter",
-            event: { to: "candidate", type: "application.viewed" },
-          });
-        } catch (err) {
-          if (!(err instanceof HireError) || err.code !== "invalid_transition") throw err;
-        }
-        app = await loadApp(ctx.db, app.id);
-      }
-      return { application: await detail(ctx, app, side) };
-    },
-  }),
-
-  defineOp({
     name: "application_withdraw",
     title: "撤回投递",
     description: "求职者撤回一条还没结束的投递：可以是还没回音的投递、还没回应的邀约，也可以是已经约好的面试。撤回后不能恢复，7 天内也不能再投同一个岗位。",
@@ -615,6 +562,84 @@ export const applicationOps = [
         });
       }
       return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
+    },
+  }),
+
+  defineOp({
+    name: "offer_respond",
+    title: "回应录用",
+    description:
+      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。过了答复期限（offer.reply_by）或岗位已经招满时不能再接受。这一步不能撤销，回应前先让用户确认。",
+    method: "POST",
+    path: "/applications/:application_id/offer/respond",
+    scopes: ["candidate:apply"],
+    readOnly: false,
+    destructive: true,
+    input: OfferRespondInput,
+    handler: async (ctx, input) => {
+      const app = await loadApp(ctx.db, input.application_id);
+      mustOwn(ctx, app, "candidate");
+      const replyBy = parseJson<{ reply_by?: string | null } | null>(app.offer, null)?.reply_by;
+      if (input.accept && app.status === "offered" && replyBy && replyBy < beijingDate()) {
+        throw new HireError("invalid_transition", "这份录用已经过了答复期限，不能再接受。想去的话请对方重新发。", {
+          current_status: app.status,
+          reply_by: replyBy,
+        });
+      }
+      await transition(ctx.db, app, ["offered"], input.accept ? "hired" : "rejected", {
+        actor: "candidate",
+        note: input.note,
+        event: { to: "recruiter", type: input.accept ? "offer.accepted" : "application.rejected" },
+        // 招满的判断和改状态放在一条语句里，两个人同时接受最后一个名额时只有一个成功
+        ...(input.accept
+          ? {
+              guard: {
+                sql: `SELECT j.headcount IS NULL OR
+                        (SELECT COUNT(*) FROM applications h WHERE h.job_id = j.id AND h.status = 'hired') < j.headcount
+                      FROM jobs j WHERE j.id = ?`,
+                params: [app.job_id],
+                error: new HireError("job_not_open", "这个岗位已经招满，这份录用不能再接受。", {
+                  current_status: app.job_status,
+                  reason: "headcount_reached",
+                }),
+              },
+            }
+          : {}),
+      });
+      // 录用人数到了招聘人数，岗位自动暂停，等招聘者决定是关闭还是继续招
+      if (input.accept) {
+        await ctx.db
+          .prepare(
+            `UPDATE jobs SET status = 'paused', updated_at = ?2 WHERE id = ?1 AND status = 'open' AND headcount IS NOT NULL
+               AND (SELECT COUNT(*) FROM applications WHERE job_id = ?1 AND status = 'hired') >= headcount`,
+          )
+          .bind(app.job_id, nowIso())
+          .run();
+      }
+      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
+    },
+  }),
+];
+
+export const recruiterApplicationOps = [
+  defineOp({
+    name: "job_applications_list",
+    title: "查看岗位收到的投递",
+    description:
+      "招聘者列出自己某个岗位下的全部投递，按更新时间从新到旧排列。这里只有摘要，不会把投递标成“已查看”。要看简历全文请调用 application_get。",
+    method: "GET",
+    path: "/jobs/:job_id/applications",
+    scopes: ["recruiter:read"],
+    readOnly: true,
+    input: JobApplicationsListInput,
+    handler: async (ctx, input) => {
+      await loadJob(ctx.db, input.job_id, ctx.auth.accountId);
+      const where: Where = { clauses: ["a.job_id = ?"], params: [input.job_id] };
+      if (input.status) {
+        where.clauses.push("a.status = ?");
+        where.params.push(input.status);
+      }
+      return listApps(ctx, where, input);
     },
   }),
 
@@ -707,30 +732,6 @@ export const applicationOps = [
   }),
 
   defineOp({
-    name: "application_reject",
-    title: "拒绝投递",
-    description:
-      "招聘者拒绝一条还没结束的投递：可以是筛简历时不合适、取消邀约、面试没通过，或撤回录用。必须在 reason 里选一个原因，求职者能看到。拒绝后不能恢复。",
-    method: "POST",
-    path: "/applications/:application_id/reject",
-    scopes: ["recruiter:invite"],
-    readOnly: false,
-    destructive: true,
-    input: ApplicationRejectInput,
-    handler: async (ctx, input) => {
-      const app = await loadApp(ctx.db, input.application_id);
-      mustOwn(ctx, app, "recruiter");
-      await transition(ctx.db, app, ACTIVE_STATUSES, "rejected", {
-        actor: "recruiter",
-        note: input.note,
-        set: { reject_reason: input.reason },
-        event: { to: "candidate", type: "application.rejected" },
-      });
-      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
-    },
-  }),
-
-  defineOp({
     name: "offer_create",
     title: "发出录用",
     description:
@@ -766,57 +767,58 @@ export const applicationOps = [
   }),
 
   defineOp({
-    name: "offer_respond",
-    title: "回应录用",
+    name: "application_reject",
+    title: "拒绝投递",
     description:
-      "求职者接受或拒绝一份录用。接受后投递变成“已录用”，流程结束；拒绝后变成“已拒绝”。过了答复期限（offer.reply_by）或岗位已经招满时不能再接受。这一步不能撤销，回应前先让用户确认。",
+      "招聘者拒绝一条还没结束的投递：可以是筛简历时不合适、取消邀约、面试没通过，或撤回录用。必须在 reason 里选一个原因，求职者能看到。拒绝后不能恢复。",
     method: "POST",
-    path: "/applications/:application_id/offer/respond",
-    scopes: ["candidate:apply"],
+    path: "/applications/:application_id/reject",
+    scopes: ["recruiter:invite"],
     readOnly: false,
     destructive: true,
-    input: OfferRespondInput,
+    input: ApplicationRejectInput,
     handler: async (ctx, input) => {
       const app = await loadApp(ctx.db, input.application_id);
-      mustOwn(ctx, app, "candidate");
-      const replyBy = parseJson<{ reply_by?: string | null } | null>(app.offer, null)?.reply_by;
-      if (input.accept && app.status === "offered" && replyBy && replyBy < beijingDate()) {
-        throw new HireError("invalid_transition", "这份录用已经过了答复期限，不能再接受。想去的话请对方重新发。", {
-          current_status: app.status,
-          reply_by: replyBy,
-        });
-      }
-      await transition(ctx.db, app, ["offered"], input.accept ? "hired" : "rejected", {
-        actor: "candidate",
+      mustOwn(ctx, app, "recruiter");
+      await transition(ctx.db, app, ACTIVE_STATUSES, "rejected", {
+        actor: "recruiter",
         note: input.note,
-        event: { to: "recruiter", type: input.accept ? "offer.accepted" : "application.rejected" },
-        // 招满的判断和改状态放在一条语句里，两个人同时接受最后一个名额时只有一个成功
-        ...(input.accept
-          ? {
-              guard: {
-                sql: `SELECT j.headcount IS NULL OR
-                        (SELECT COUNT(*) FROM applications h WHERE h.job_id = j.id AND h.status = 'hired') < j.headcount
-                      FROM jobs j WHERE j.id = ?`,
-                params: [app.job_id],
-                error: new HireError("job_not_open", "这个岗位已经招满，这份录用不能再接受。", {
-                  current_status: app.job_status,
-                  reason: "headcount_reached",
-                }),
-              },
-            }
-          : {}),
+        set: { reject_reason: input.reason },
+        event: { to: "candidate", type: "application.rejected" },
       });
-      // 录用人数到了招聘人数，岗位自动暂停，等招聘者决定是关闭还是继续招
-      if (input.accept) {
-        await ctx.db
-          .prepare(
-            `UPDATE jobs SET status = 'paused', updated_at = ?2 WHERE id = ?1 AND status = 'open' AND headcount IS NOT NULL
-               AND (SELECT COUNT(*) FROM applications WHERE job_id = ?1 AND status = 'hired') >= headcount`,
-          )
-          .bind(app.job_id, nowIso())
-          .run();
+      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "recruiter") };
+    },
+  }),
+];
+
+export const sharedApplicationOps = [
+  defineOp({
+    name: "application_get",
+    title: "查看投递详情",
+    description:
+      "查看一条投递的全部信息：状态、邀约内容、筛选问题的回答、录用内容、每一步的备注记录。招聘者还能看到求职者的简历和这次投递附带的 custom_resume；招聘者第一次查看时，投递会从“已投递”变成“已查看”，求职者会收到通知。状态是“已接受”“已发录用”“已录用”时，contact 字段里才有对方的联系方式。",
+    method: "GET",
+    path: "/applications/:application_id",
+    scopes: ["candidate:read", "recruiter:read"],
+    readOnly: false,
+    readOnlyFor: ["candidate"],
+    idempotent: true,
+    input: ApplicationGetInput,
+    handler: async (ctx, input) => {
+      let app = await loadApp(ctx.db, input.application_id);
+      const side = sideOf(ctx, app);
+      if (side === "recruiter" && app.status === "applied") {
+        try {
+          await transition(ctx.db, app, ["applied"], "viewed", {
+            actor: "recruiter",
+            event: { to: "candidate", type: "application.viewed" },
+          });
+        } catch (err) {
+          if (!(err instanceof HireError) || err.code !== "invalid_transition") throw err;
+        }
+        app = await loadApp(ctx.db, app.id);
       }
-      return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
+      return { application: await detail(ctx, app, side) };
     },
   }),
 

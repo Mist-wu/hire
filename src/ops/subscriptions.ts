@@ -126,46 +126,29 @@ export const subscriptionOps = [
         throw invalid([{ field: "filters", message: "至少传一个搜索条件。" }]);
       }
       checkSalaryPair(input.filters);
-      const sameAs = (name: string) =>
-        invalid([{ field: "filters", message: `和已有的订阅“${name}”条件相同。` }], "已经有一个条件相同的订阅，不用再建。");
-      const findSame = () =>
-        ctx.db
-          .prepare("SELECT name FROM subscriptions WHERE account_id = ? AND filters = ?")
-          .bind(ctx.auth.accountId, filters)
-          .first<{ name: string }>();
-      const same = await findSame();
-      if (same) throw sameAs(same.name);
-      const full = invalid(
+      const now = nowIso();
+      const row = await ctx.db
+        .prepare(
+          `INSERT INTO subscriptions (id, account_id, name, filters, cursor_at, created_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?5
+           WHERE (SELECT COUNT(*) FROM subscriptions WHERE account_id = ?2) < ?6
+           ON CONFLICT (account_id, filters) DO NOTHING RETURNING *`,
+        )
+        .bind(newId("sub"), ctx.auth.accountId, input.name, filters, now, MAX_SUBSCRIPTIONS)
+        .first<SubRow>();
+      if (row) return { subscription: toApi(row) };
+
+      const same = await ctx.db
+        .prepare("SELECT name FROM subscriptions WHERE account_id = ? AND filters = ?")
+        .bind(ctx.auth.accountId, filters)
+        .first<{ name: string }>();
+      if (same) {
+        throw invalid([{ field: "filters", message: `和已有的订阅“${same.name}”条件相同。` }], "已经有一个条件相同的订阅，不用再建。");
+      }
+      throw invalid(
         [{ field: "name", message: `最多 ${MAX_SUBSCRIPTIONS} 个订阅。` }],
         `订阅已达上限 ${MAX_SUBSCRIPTIONS} 个。先用 subscription_delete 删掉一个。`,
       );
-      const now = nowIso();
-      const row: SubRow = {
-        id: newId("sub"),
-        account_id: ctx.auth.accountId,
-        name: input.name,
-        filters,
-        cursor_at: now,
-        cursor_job_id: "",
-        created_at: now,
-      };
-      // 上限写在插入语句里，相同条件由唯一索引挡住，并发创建也挤不过去
-      let result;
-      try {
-        result = await ctx.db
-          .prepare(
-            `INSERT INTO subscriptions (id, account_id, name, filters, cursor_at, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6
-             WHERE (SELECT COUNT(*) FROM subscriptions WHERE account_id = ?2) < ?7`,
-          )
-          .bind(row.id, row.account_id, row.name, row.filters, row.cursor_at, row.created_at, MAX_SUBSCRIPTIONS)
-          .run();
-      } catch (err) {
-        if (!String(err).includes("UNIQUE")) throw err;
-        throw sameAs((await findSame())?.name ?? "");
-      }
-      if (!result.meta.changes) throw full;
-      return { subscription: toApi(row) };
     },
   }),
 

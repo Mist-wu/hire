@@ -1,5 +1,5 @@
 import type { Ctx } from "../env";
-import { HireError, invalid, notFound } from "../errors";
+import { invalid, notFound } from "../errors";
 import { hitRate, limits } from "../quota";
 import { defineOp } from "../registry";
 import {
@@ -52,22 +52,12 @@ interface ExpectationData {
 /** 公开简历。不含手机、邮箱和 PDF。 */
 export function candidatePublic(row: CandidateRow) {
   return {
-    id: row.account_id,
-    name: row.name,
-    school: row.school,
-    degree: row.degree,
-    major: row.major,
-    grad_year: row.grad_year,
-    city: row.city,
+    ...candidateSummary(row),
     summary: row.summary,
-    skills: parseJson<string[]>(row.skills, []),
     education: parseJson<unknown[]>(row.education, []),
     experience: parseJson<unknown[]>(row.experience, []),
     projects: parseJson<unknown[]>(row.projects, []),
     links: parseJson<string[]>(row.links, []),
-    expectation: parseJson<ExpectationData>(row.expectation, {}),
-    active_at: row.active_at,
-    updated_at: row.updated_at,
   };
 }
 
@@ -130,7 +120,7 @@ async function myContacts(ctx: Ctx, candidateIds: string[]) {
   return out;
 }
 
-export const candidateOps = [
+export const profileOps = [
   defineOp({
     name: "profile_get",
     title: "查看我的资料",
@@ -352,7 +342,9 @@ export const candidateOps = [
       return { deleted: old != null, withdrawn_applications: withdrawn?.meta.changes ?? 0 };
     },
   }),
+];
 
+export const candidateSearchOps = [
   defineOp({
     name: "candidates_search",
     title: "搜索求职者",

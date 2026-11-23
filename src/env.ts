@@ -29,7 +29,6 @@ export const ROLE_SCOPES: Record<Role, Scope[]> = {
 
 export interface Auth {
   accountId: string;
-  login: string;
   /** 账号的身份。一个账号只能是求职者或招聘者，第一次登录时选定 */
   role: Role | null;
   scopes: Set<Scope>;
@@ -39,7 +38,6 @@ export interface Ctx {
   env: Env;
   db: D1Database;
   auth: Auth;
-  origin: string;
 }
 
 export const ROLE_NAMES: Record<Role, string> = { candidate: "求职者", recruiter: "招聘者" };

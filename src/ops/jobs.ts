@@ -406,7 +406,7 @@ export function addJobFilters(where: Where, input: JobFilters): void {
   addKeyword(where, input.q, { fts: "jobs_fts", ftsKey: "job_id", idCol: "j.id", textCol: "j.search_text" });
 }
 
-export const jobOps = [
+export const recruiterJobOps = [
   defineOp({
     name: "company_get",
     title: "查看我的公司",
@@ -551,9 +551,7 @@ export const jobOps = [
       } else {
         company = await primaryCompany(ctx.db, ctx.auth.accountId);
         if (!company) {
-          throw new HireError("validation_failed", "你还没有公司。先调用 company_upsert 创建公司，再发布岗位。", {
-            fields: [{ field: "company_id", message: "没有可用的公司" }],
-          });
+          throw invalid([{ field: "company_id", message: "没有可用的公司" }], "你还没有公司。先调用 company_upsert 创建公司，再发布岗位。");
         }
       }
       const id = newId("job");
@@ -708,27 +706,9 @@ export const jobOps = [
       };
     },
   }),
+];
 
-  defineOp({
-    name: "job_get",
-    title: "查看岗位详情",
-    description:
-      "查看一个岗位的全部信息，包括公司资料、职责、要求、薪资和筛选问题。accepting 为 false 表示现在不能投递（暂停、关闭或过了截止日期）。recruiter 字段是招聘者的活跃度：最近活跃时间、近 90 天收到的投递数、做出决定（邀约或拒绝）的比例和平均用时。求职者还会看到 my_application：自己对这个岗位最近一条投递的编号和状态。搜索结果只有摘要，判断是否合适前先读详情。",
-    method: "GET",
-    path: "/jobs/:job_id",
-    scopes: ["candidate:read", "recruiter:read"],
-    readOnly: true,
-    input: JobGetInput,
-    handler: async (ctx, input) => {
-      const job = await getJob(ctx, input.job_id);
-      // 求职者读一次算一次，招聘者读的不算
-      if (ctx.auth.role === "candidate") {
-        await ctx.db.prepare("UPDATE jobs SET detail_views = detail_views + 1 WHERE id = ?").bind(job.id).run();
-      }
-      return { job };
-    },
-  }),
-
+export const publicJobOps = [
   defineOp({
     name: "jobs_search",
     title: "搜索岗位",
@@ -776,6 +756,26 @@ export const jobOps = [
         })),
         next_cursor,
       };
+    },
+  }),
+
+  defineOp({
+    name: "job_get",
+    title: "查看岗位详情",
+    description:
+      "查看一个岗位的全部信息，包括公司资料、职责、要求、薪资和筛选问题。accepting 为 false 表示现在不能投递（暂停、关闭或过了截止日期）。recruiter 字段是招聘者的活跃度：最近活跃时间、近 90 天收到的投递数、做出决定（邀约或拒绝）的比例和平均用时。求职者还会看到 my_application：自己对这个岗位最近一条投递的编号和状态。搜索结果只有摘要，判断是否合适前先读详情。",
+    method: "GET",
+    path: "/jobs/:job_id",
+    scopes: ["candidate:read", "recruiter:read"],
+    readOnly: true,
+    input: JobGetInput,
+    handler: async (ctx, input) => {
+      const job = await getJob(ctx, input.job_id);
+      // 求职者读一次算一次，招聘者读的不算
+      if (ctx.auth.role === "candidate") {
+        await ctx.db.prepare("UPDATE jobs SET detail_views = detail_views + 1 WHERE id = ?").bind(job.id).run();
+      }
+      return { job };
     },
   }),
 ];

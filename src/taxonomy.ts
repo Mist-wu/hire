@@ -5,7 +5,7 @@ export const RECRUIT_TYPES = {
   intern_daily: "日常实习",
   part_time: "兼职",
 } as const;
-export type RecruitType = keyof typeof RECRUIT_TYPES;
+type RecruitType = keyof typeof RECRUIT_TYPES;
 export const INTERN_TYPES: RecruitType[] = ["intern_grad", "intern_daily"];
 
 const CATEGORY_TREE = {

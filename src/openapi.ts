@@ -1,7 +1,7 @@
 import pkg from "../package.json";
 import { SCOPES, type Scope } from "./env";
 import { OPS } from "./ops";
-import { inputSchema } from "./registry";
+import { PDF_DOWNLOADS } from "./rest";
 
 const ERROR_SCHEMA = {
   type: "object",
@@ -21,23 +21,10 @@ function security(scopes: Scope[]) {
   return scopes.length ? scopes.map((s) => ({ bearer: [s] })) : [{ bearer: [] }];
 }
 
-function pdfDownload(summary: string, description: string, scope: Scope, parameters: unknown[] = []) {
-  return {
-    summary,
-    description,
-    security: security([scope]),
-    ...(parameters.length ? { parameters } : {}),
-    responses: {
-      "200": { description: "PDF 文件", content: { "application/pdf": { schema: { type: "string", format: "binary" } } } },
-      default: ERROR_RESPONSE,
-    },
-  };
-}
-
 export function openapi(origin: string) {
   const paths: Record<string, Record<string, unknown>> = {};
   for (const op of OPS) {
-    const schema = inputSchema(op);
+    const schema = op.inputSchema;
     const props = { ...(schema.properties ?? {}) };
     const required = new Set(schema.required ?? []);
     const pathParams = [...op.path.matchAll(/:(\w+)/g)].map((m) => m[1]!);
@@ -94,17 +81,21 @@ export function openapi(origin: string) {
     (paths[path] ??= {})[op.method.toLowerCase()] = operation;
   }
 
-  (paths["/v1/me/resume/pdf"] ??= {}).get = pdfDownload(
-    "下载我的 PDF 简历",
-    "求职者下载自己上传的 PDF。只有 REST，没有对应的 MCP 工具。",
-    "candidate:read",
-  );
-  (paths["/v1/applications/{application_id}/resume.pdf"] ??= {}).get = pdfDownload(
-    "下载求职者的 PDF 简历",
-    "招聘者下载这条投递对应求职者的 PDF。投递必须是“已接受”“已发录用”或“已录用”。只有 REST，没有对应的 MCP 工具。",
-    "recruiter:read",
-    [{ name: "application_id", in: "path", required: true, schema: { type: "string" } }],
-  );
+  for (const { path, summary, description, scope } of PDF_DOWNLOADS) {
+    const parameters = [...path.matchAll(/:(\w+)/g)].map(([, name]) => ({
+      name, in: "path", required: true, schema: { type: "string" },
+    }));
+    (paths[path.replace(/:(\w+)/g, "{$1}")] ??= {}).get = {
+      summary,
+      description,
+      security: security([scope]),
+      ...(parameters.length ? { parameters } : {}),
+      responses: {
+        "200": { description: "PDF 文件", content: { "application/pdf": { schema: { type: "string", format: "binary" } } } },
+        default: ERROR_RESPONSE,
+      },
+    };
+  }
 
   return {
     openapi: "3.1.0",

@@ -19,7 +19,7 @@ export async function sha256Hex(input: string): Promise<string> {
   return hex(new Uint8Array(digest));
 }
 
-export function base64url(bytes: Uint8Array): string {
+function base64url(bytes: Uint8Array): string {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

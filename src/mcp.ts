@@ -3,9 +3,7 @@ import pkg from "../package.json";
 import type { Env, Role } from "./env";
 import { HireError } from "./errors";
 import { OPS, opsFor, requireScope, touchActive } from "./ops";
-import { inputSchema } from "./registry";
 import { makeCtx } from "./rest";
-import { parseInput } from "./schemas";
 
 type C = Context<{ Bindings: Env }>;
 
@@ -36,7 +34,7 @@ function toolDef(op: (typeof OPS)[number], role: Role | null) {
     name: op.name,
     title: op.title,
     description: op.description,
-    inputSchema: inputSchema(op),
+    inputSchema: op.inputSchema,
     annotations: {
       title: op.title,
       readOnlyHint: readOnly,
@@ -47,25 +45,12 @@ function toolDef(op: (typeof OPS)[number], role: Role | null) {
   };
 }
 
-export function unauthorized(c: C, err: HireError): Response {
-  const url = new URL(c.req.url);
-  return c.json(err.toJSON(), 401, {
-    "WWW-Authenticate": `Bearer realm="hire", resource_metadata="${url.origin}/.well-known/oauth-protected-resource/mcp"`,
-  });
-}
-
 export async function handleMcp(c: C): Promise<Response> {
   if (c.req.method !== "POST") {
     // 无状态服务：不提供服务端推送的 GET 流，也没有会话可删
     return c.json(rpcError(null, -32000, "这个端点只接受 POST。"), 405, { Allow: "POST" });
   }
-  let ctx;
-  try {
-    ctx = await makeCtx(c);
-  } catch (err) {
-    if (err instanceof HireError && err.code === "unauthorized") return unauthorized(c, err);
-    throw err;
-  }
+  const ctx = await makeCtx(c);
 
   let payload: unknown;
   try {
@@ -104,8 +89,7 @@ export async function handleMcp(c: C): Promise<Response> {
         }
         try {
           requireScope(op, ctx.auth);
-          const input = parseInput(op.input, req.params?.arguments ?? {});
-          const result = (await op.handler(ctx, input)) as Record<string, unknown>;
+          const result = await op.handler(ctx, req.params?.arguments);
           await touchActive(ctx, op);
           return ok({ content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result });
         } catch (err) {

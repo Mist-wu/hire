@@ -91,15 +91,14 @@ export async function authenticate(db: D1Database, request: Request): Promise<Au
   // 受众留空的是加上资源绑定之前签发的，照旧可用，刷新后换成绑定的
   const row = await db
     .prepare(
-      `SELECT t.account_id, t.scopes, a.github_login, a.role FROM tokens t JOIN accounts a ON a.id = t.account_id
+      `SELECT t.account_id, t.scopes, a.role FROM tokens t JOIN accounts a ON a.id = t.account_id
        WHERE t.access_hash = ? AND t.revoked = 0 AND t.access_expires_at > ? AND (t.resource IS NULL OR t.resource = ?)`,
     )
     .bind(await sha256Hex(match[1]!), nowIso(), resourceUri(new URL(request.url).origin))
-    .first<{ account_id: string; scopes: string; github_login: string; role: Role | null }>();
+    .first<{ account_id: string; scopes: string; role: Role | null }>();
   if (!row) throw new HireError("unauthorized", "令牌无效、已过期或不是发给这个服务的。用刷新令牌换一个新的，或重新登录。");
   return {
     accountId: row.account_id,
-    login: row.github_login,
     role: row.role,
     // 令牌的范围不能超出账号的身份
     scopes: new Set(
