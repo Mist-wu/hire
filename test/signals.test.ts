@@ -122,10 +122,11 @@ describe("面试之后", () => {
     expect(early.data.error.code).toBe("invalid_transition");
     expect((await api("POST", `/applications/${appId}/offer`, hr, { salary: 300 })).status).toBe(422);
 
+    const startDate = future(7).slice(0, 10);
     const offered = await api("POST", `/applications/${appId}/offer`, hr, {
-      start_date: "2026-11-02", salary: 300, salary_unit: "per_day", note: "欢迎加入。",
+      start_date: startDate, salary: 300, salary_unit: "per_day", note: "欢迎加入。",
     });
-    expect(offered.data.application).toMatchObject({ status: "offered", offer: { start_date: "2026-11-02", salary: 300 } });
+    expect(offered.data.application).toMatchObject({ status: "offered", offer: { start_date: startDate, salary: 300 } });
     expect(offered.data.application.contact.phone).toBe("13800000000");
     expect((await api("GET", "/events", seeker)).data.events.at(-1)).toMatchObject({ type: "offer.created", note: "欢迎加入。" });
 
