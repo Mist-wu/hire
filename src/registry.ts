@@ -1,4 +1,4 @@
-import type { z } from "zod";
+import * as z from "zod";
 import type { Ctx, Role, Scope } from "./env";
 
 export interface Op {
@@ -24,4 +24,24 @@ export function defineOp<S extends z.ZodType>(
   def: Omit<Op, "input" | "handler"> & { input: S; handler: (ctx: Ctx, input: z.infer<S>) => Promise<unknown> },
 ): Op {
   return def;
+}
+
+export interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  [key: string]: unknown;
+}
+
+const schemaCache = new Map<string, JsonSchema>();
+
+/** 入参的 JSON Schema。MCP 工具定义、OpenAPI 和 REST 查询串转换共用 */
+export function inputSchema(op: Op): JsonSchema {
+  let schema = schemaCache.get(op.name);
+  if (!schema) {
+    schema = z.toJSONSchema(op.input) as JsonSchema;
+    delete schema.$schema;
+    schemaCache.set(op.name, schema);
+  }
+  return schema;
 }

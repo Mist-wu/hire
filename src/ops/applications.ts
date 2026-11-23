@@ -223,7 +223,8 @@ async function transition(
 }
 
 /**
- * 新建投递。限额写在插入语句的条件里：先数再插分两步的话，并发请求能一起挤过上限。
+ * 新建投递。限额和岗位开放写在插入语句的条件里：先查再插分两步的话，并发请求能一起挤过上限，
+ * 岗位刚被关闭也还能插进来。
  */
 async function insertApplication(
   db: D1Database,
@@ -256,7 +257,8 @@ async function insertApplication(
              rev, created_at, updated_at, answers)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10
            WHERE (SELECT COUNT(*) FROM applications
-                  WHERE ${scope} = ?11 AND initiated_by = ?4 AND created_at >= ?12) < ?13`,
+                  WHERE ${scope} = ?11 AND initiated_by = ?4 AND created_at >= ?12) < ?13
+             AND EXISTS (SELECT 1 FROM jobs WHERE id = ?2 AND status = 'open' AND (deadline IS NULL OR deadline >= ?14))`,
         )
         .bind(
           id,
@@ -272,6 +274,7 @@ async function insertApplication(
           scopeValue,
           day.start,
           fields.quota.limit,
+          beijingDate(),
         ),
       db
         .prepare(
@@ -290,8 +293,19 @@ async function insertApplication(
     if (String(err).includes("UNIQUE")) throw duplicate(null);
     throw err;
   }
-  if (!results[0]?.meta.changes) throw quotaExceeded(fields.quota.what, fields.quota.limit, day.end);
+  if (!results[0]?.meta.changes) {
+    const { job } = await loadJob(db, fields.jobId);
+    if (!acceptsApplications(job)) throw jobNotOpen(job);
+    throw quotaExceeded(fields.quota.what, fields.quota.limit, day.end);
+  }
   return id;
+}
+
+function jobNotOpen(job: { status: string; deadline: string | null }): HireError {
+  return new HireError("job_not_open", "这个岗位现在不接受投递或邀约：已暂停、已关闭，或过了截止日期。", {
+    current_status: job.status,
+    deadline: job.deadline,
+  });
 }
 
 function duplicate(existing: { id: string; status: string } | null, retryAfter?: string): HireError {
@@ -419,7 +433,7 @@ export const applicationOps = [
     name: "application_create",
     title: "投递岗位",
     description:
-      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。岗位有筛选问题（job_get 返回的 questions）时，必须在 answers 里按顺序逐个回答，答案要来自用户，不要自己编。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。岗位暂停、关闭或过了截止日期时不能投。每天最多投 20 次。",
+      "求职者向一个岗位投递。可以附一份针对这个岗位改写的 custom_resume 和一段备注。岗位有筛选问题（job_get 返回的 questions）时，必须在 answers 里按顺序逐个回答，答案要来自用户，不要自己编。投递会被对方看到，发出前先让用户确认内容。同一个岗位不能重复投；被拒绝或撤回后 7 天内不能再投。岗位暂停、关闭或过了截止日期时不能投。每天的投递次数有限额，余量用 quota_get 查。",
     method: "POST",
     path: "/applications",
     scopes: ["candidate:apply"],
@@ -436,12 +450,7 @@ export const applicationOps = [
         );
       }
       const { job, company } = await loadJob(ctx.db, input.job_id);
-      if (!acceptsApplications(job)) {
-        throw new HireError("job_not_open", "这个岗位现在不接受投递：已暂停、已关闭，或过了截止日期。", {
-          current_status: job.status,
-          deadline: job.deadline,
-        });
-      }
+      if (!acceptsApplications(job)) throw jobNotOpen(job);
       checkRepeat(await latestBetween(ctx.db, job.id, me));
       if (input.custom_resume) checkResume(input.custom_resume, "custom_resume.");
       const answers = checkAnswers(parseJson<Question[]>(job.questions, []), input.answers);
@@ -613,7 +622,7 @@ export const applicationOps = [
     name: "invitation_create",
     title: "发出面试邀约",
     description:
-      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递，对已经发出的邀约再调一次就是改时间；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间，线下面试要写地址。改时间每条投递最多 3 次；对方已经接受的面试也能改，改完要等对方重新选时间，这期间看不到联系方式。主动邀约每个岗位每天最多 20 次；对方拒绝或撤回后 7 天内不能再邀约同一个人。",
+      "招聘者发出面试邀约。两种用法：传 application_id 是回应一条已有的投递，对已经发出的邀约再调一次就是改时间；传 job_id 加 candidate_id 是主动邀约一位还没投递的求职者，会新建一条投递。邀约里要给出面试方式和 1 到 5 个可选时间，线下面试要写地址。改时间每条投递最多 3 次；对方已经接受的面试也能改，改完要等对方重新选时间，这期间看不到联系方式。主动邀约每个岗位每天有限额，余量用 quota_get 传 job_id 查；对方拒绝或撤回后 7 天内不能再邀约同一个人。",
     method: "POST",
     path: "/invitations",
     scopes: ["recruiter:invite"],
@@ -668,12 +677,7 @@ export const applicationOps = [
       }
 
       const { job, company } = await loadJob(ctx.db, input.job_id!, ctx.auth.accountId);
-      if (!acceptsApplications(job)) {
-        throw new HireError("job_not_open", "这个岗位没有开放或过了截止日期，不能发邀约。", {
-          current_status: job.status,
-          deadline: job.deadline,
-        });
-      }
+      if (!acceptsApplications(job)) throw jobNotOpen(job);
       const candidate = await loadCandidate(ctx.db, input.candidate_id!);
       if (!candidate || candidate.name == null || candidate.resume_public !== 1) throw notFound("求职者");
       checkRepeat(await latestBetween(ctx.db, job.id, candidate.account_id));
@@ -796,6 +800,7 @@ export const applicationOps = [
                 params: [app.job_id],
                 error: new HireError("job_not_open", "这个岗位已经招满，这份录用不能再接受。", {
                   current_status: app.job_status,
+                  reason: "headcount_reached",
                 }),
               },
             }
@@ -805,10 +810,10 @@ export const applicationOps = [
       if (input.accept) {
         await ctx.db
           .prepare(
-            `UPDATE jobs SET status = 'paused' WHERE id = ?1 AND status = 'open' AND headcount IS NOT NULL
+            `UPDATE jobs SET status = 'paused', updated_at = ?2 WHERE id = ?1 AND status = 'open' AND headcount IS NOT NULL
                AND (SELECT COUNT(*) FROM applications WHERE job_id = ?1 AND status = 'hired') >= headcount`,
           )
-          .bind(app.job_id)
+          .bind(app.job_id, nowIso())
           .run();
       }
       return { application: await detail(ctx, await loadApp(ctx.db, app.id), "candidate") };
@@ -819,7 +824,7 @@ export const applicationOps = [
     name: "events_poll",
     title: "拉取新事件",
     description:
-      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约改了时间、邀约被接受、收到录用、录用被接受、被拒绝、被撤回、岗位关闭、投递过期，以及订阅命中的新岗位（job.matched，没有 application_id，用 job_get 读详情）。服务端记着你上次拉到哪，直接调用就只返回新事件；has_more 为 true 时再调一次。想重看旧事件时传 after。事件里只有摘要，投递详情用 application_get 取。有未结束的投递或有订阅时每 10 分钟拉一次就够，每分钟最多 6 次。",
+      "拉取发给你的新事件：新投递、被查看、收到邀约、邀约改了时间、邀约被接受、收到录用、录用被接受、被拒绝、被撤回、岗位关闭、投递过期，以及订阅命中的新岗位（job.matched，没有 application_id，用 job_get 读详情）。服务端记着你上次拉到哪，直接调用就只返回新事件；has_more 为 true 时再调一次。想重看旧事件时传 after。事件里只有摘要，投递详情用 application_get 取。有未结束的投递或有订阅时每 10 分钟拉一次就够。",
     method: "GET",
     path: "/events",
     scopes: [],
@@ -871,7 +876,8 @@ export const applicationOps = [
   defineOp({
     name: "quota_get",
     title: "查看限额余量",
-    description: "查看各项限额今天或这一分钟还剩多少，以及什么时候重置。",
+    description:
+      "查看限额。求职者能看到今天还能投几次、什么时候重置；招聘者传 job_id 能看到这个岗位今天还能主动邀约几次。搜索和拉取事件只返回每分钟的上限。",
     method: "GET",
     path: "/quota",
     scopes: [],
@@ -911,6 +917,7 @@ export async function resumePdfForApplication(ctx: Ctx, applicationId: string) {
   if (!CONTACT_STATUSES.includes(app.status)) {
     throw new HireError("invalid_transition", "只有对方接受邀约之后，才能下载 PDF 简历。", {
       current_status: app.status,
+      reason: "contact_locked",
     });
   }
   const candidate = await loadCandidate(ctx.db, app.candidate_id);

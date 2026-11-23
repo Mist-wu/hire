@@ -1,7 +1,7 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { oauth } from "./auth/oauth";
-import type { Env } from "./env";
+import type { Env, Scope } from "./env";
 import { HireError } from "./errors";
 import { handleMcp, unauthorized } from "./mcp";
 import { openapi } from "./openapi";
@@ -74,22 +74,24 @@ async function sendPdf(env: Env, key: string, filename: string): Promise<Respons
   });
 }
 
+async function ctxWithScope(c: Context<{ Bindings: Env }>, scope: Scope) {
+  const ctx = await makeCtx(c);
+  if (!ctx.auth.scopes.has(scope)) {
+    throw new HireError("forbidden_scope", `需要 ${scope} 范围。`, { required: [scope], granted: [...ctx.auth.scopes] });
+  }
+  return ctx;
+}
+
 // 两个下载地址只有 REST，没有对应的 MCP 工具
 app.get("/v1/me/resume/pdf", async (c) => {
-  const ctx = await makeCtx(c);
-  if (!ctx.auth.scopes.has("candidate:read")) {
-    throw new HireError("forbidden_scope", "需要 candidate:read 范围。", { required: ["candidate:read"] });
-  }
+  const ctx = await ctxWithScope(c, "candidate:read");
   const row = await loadCandidate(ctx.db, ctx.auth.accountId);
   if (!row?.pdf_key) throw new HireError("not_found", "你还没有上传过 PDF 简历。");
   return sendPdf(c.env, row.pdf_key, row.pdf_name ?? "resume.pdf");
 });
 
 app.get("/v1/applications/:application_id/resume.pdf", async (c) => {
-  const ctx = await makeCtx(c);
-  if (!ctx.auth.scopes.has("recruiter:read")) {
-    throw new HireError("forbidden_scope", "需要 recruiter:read 范围。", { required: ["recruiter:read"] });
-  }
+  const ctx = await ctxWithScope(c, "recruiter:read");
   const { key, filename } = await resumePdfForApplication(ctx, c.req.param("application_id"));
   return sendPdf(c.env, key, filename);
 });

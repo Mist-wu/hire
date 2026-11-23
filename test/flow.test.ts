@@ -1,5 +1,6 @@
+import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { api, future, setup } from "./helpers";
+import { BASE, api, future, setup } from "./helpers";
 
 describe("完整流程", () => {
   it("发岗位、投递、查看、邀约、接受、互见联系方式", async () => {
@@ -93,6 +94,8 @@ describe("完整流程", () => {
     expect(notPdf.status).toBe(422);
 
     const appId = (await api("POST", "/applications", seeker, { job_id: job.id })).data.application.id;
+    const locked = await SELF.fetch(`${BASE}/v1/applications/${appId}/resume.pdf`, { headers: { Authorization: `Bearer ${hr}` } });
+    expect((await locked.json<any>()).error).toMatchObject({ code: "invalid_transition", details: { reason: "contact_locked" } });
     const slot = future(2);
     await api("POST", "/invitations", hr, { application_id: appId, mode: "online", slots: [slot] });
     await api("POST", `/applications/${appId}/respond`, seeker, { accept: true, slot });

@@ -45,7 +45,7 @@ export const OPS: Op[] = ORDER.map((name) => {
   return found;
 });
 
-export function allowed(op: Op, auth: Auth): boolean {
+function allowed(op: Op, auth: Auth): boolean {
   return op.scopes.length === 0 || op.scopes.some((s) => auth.scopes.has(s));
 }
 

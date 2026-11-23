@@ -17,9 +17,9 @@ import {
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
 import { CATEGORY_NAMES, DEGREE_RANK, PENDING_STATUSES, type Degree } from "../taxonomy";
-import { beijingDate, nameKey, newId, normCity, nowIso, parseJson, randomHex } from "../util";
+import { beijingDate, nameKey, newId, normCity, nowIso, parseJson } from "../util";
 
-export interface CompanyRow {
+interface CompanyRow {
   id: string;
   owner_account_id: string;
   name: string;
@@ -35,7 +35,7 @@ export interface CompanyRow {
   updated_at: string;
 }
 
-export interface JobRow {
+interface JobRow {
   id: string;
   company_id: string;
   title: string;
@@ -67,7 +67,7 @@ export interface JobRow {
   updated_at: string;
 }
 
-export function companyToApi(row: CompanyRow, opts: { withContact?: boolean } = {}) {
+function companyToApi(row: CompanyRow, opts: { withContact?: boolean } = {}) {
   return {
     id: row.id,
     name: row.name,
@@ -108,7 +108,7 @@ function jobFieldsFromRow(row: JobRow): JobFields {
   };
 }
 
-export function jobToApi(row: JobRow, company: CompanyRow) {
+function jobToApi(row: JobRow, company: CompanyRow) {
   return {
     id: row.id,
     status: row.status,
@@ -180,7 +180,7 @@ function jobSummary(row: JobRow & { company_name: string; recruiter_active_at: s
   };
 }
 
-export async function primaryCompany(db: D1Database, accountId: string): Promise<CompanyRow | null> {
+async function primaryCompany(db: D1Database, accountId: string): Promise<CompanyRow | null> {
   return db
     .prepare("SELECT * FROM companies WHERE owner_account_id = ? ORDER BY created_at, id LIMIT 1")
     .bind(accountId)
@@ -217,15 +217,35 @@ function jobSearchText(
   ].join("\n");
 }
 
+/**
+ * 写岗位和它的城市、技能、届别、全文索引。所有语句都带同一个条件，岗位行放在最后写，
+ * 这样条件按写入前的状态判断，不成立时整批都不生效。调用方看最后一条的 changes 判断是否写入。
+ * 条件：公司名还是读到的那个（搜索文本里有公司名）；修改时岗位还是读到的版本，且没有关闭。
+ */
+/** 和 jobSearchText 相同的拼法，写成 SQL。?1 是职类名称表（JSON），公司名取库里当前的。 */
+const SEARCH_TEXT_SQL = `title || char(10) || (SELECT name FROM companies WHERE id = jobs.company_id) || char(10)
+  || COALESCE(json_extract(?1, '$."' || category || '"'), '') || char(10)
+  || COALESCE((SELECT group_concat(value, ' ') FROM json_each(jobs.cities)), '') || char(10)
+  || COALESCE((SELECT group_concat(value, ' ') FROM json_each(jobs.skills)), '') || char(10)
+  || duties || char(10) || requirements || char(10) || COALESCE(bonus, '')`;
+
+function closedJob(): HireError {
+  return new HireError("job_not_open", "这个岗位已经关闭，不能再修改。需要的话重新发布一个。", { current_status: "closed" });
+}
+
+function changedConcurrently(what: string): HireError {
+  return new HireError("invalid_transition", `${what}刚刚被改动过。重新读取后再试一次。`);
+}
+
 function jobWriteStatements(
   db: D1Database,
   id: string,
   company: CompanyRow,
   f: JobFields,
   status: string,
-  createdAt: string,
   openedAt: string,
   now: string,
+  existing?: Pick<JobRow, "updated_at">,
 ): D1PreparedStatement[] {
   const cities = [...new Set(f.cities.map(normCity))];
   const skills = [...new Set((f.skills ?? []).map((s) => s.trim()))];
@@ -233,7 +253,6 @@ function jobWriteStatements(
   const searchText = jobSearchText({ ...f, cities, skills }, company.name);
   const bool = (v: boolean | null | undefined) => (v == null ? null : v ? 1 : 0);
 
-  // 这些列在修改岗位时整体覆盖；id、company_id、created_at 只在新建时写
   const columns: Record<string, unknown> = {
     title: f.title,
     recruit_type: f.recruit_type,
@@ -265,30 +284,34 @@ function jobWriteStatements(
     updated_at: now,
   };
   const names = Object.keys(columns);
+  const values = names.map((n) => columns[n]);
+
+  const guard = existing
+    ? {
+        sql: `EXISTS (SELECT 1 FROM jobs gj JOIN companies gc ON gc.id = gj.company_id
+               WHERE gj.id = ? AND gj.updated_at = ? AND gj.status <> 'closed' AND gc.name = ?)`,
+        params: [id, existing.updated_at, company.name],
+      }
+    : { sql: "EXISTS (SELECT 1 FROM companies gc WHERE gc.id = ? AND gc.name = ?)", params: [company.id, company.name] };
+  const when = (sql: string, ...params: unknown[]) => db.prepare(`${sql} AND ${guard.sql}`).bind(...params, ...guard.params);
+  const insertWhen = (sql: string, ...params: unknown[]) =>
+    db.prepare(`${sql} SELECT ${placeholders(params.length)} WHERE ${guard.sql}`).bind(...params, ...guard.params);
 
   const stmts = [
-    db
-      .prepare(
-        `INSERT INTO jobs (id, company_id, created_at, ${names.join(", ")})
-         VALUES (?, ?, ?, ${placeholders(names.length)})
-         ON CONFLICT (id) DO UPDATE SET ${names.map((n) => `${n} = excluded.${n}`).join(", ")}`,
-      )
-      .bind(id, company.id, createdAt, ...names.map((n) => columns[n])),
-    db.prepare("DELETE FROM job_cities WHERE job_id = ?").bind(id),
-    db.prepare("DELETE FROM job_skills WHERE job_id = ?").bind(id),
-    db.prepare("DELETE FROM job_grad_years WHERE job_id = ?").bind(id),
-    db.prepare("DELETE FROM jobs_fts WHERE job_id = ?").bind(id),
-    db.prepare("INSERT INTO jobs_fts (job_id, body) VALUES (?, ?)").bind(id, searchText),
+    when("DELETE FROM job_cities WHERE job_id = ?", id),
+    when("DELETE FROM job_skills WHERE job_id = ?", id),
+    when("DELETE FROM job_grad_years WHERE job_id = ?", id),
+    when("DELETE FROM jobs_fts WHERE job_id = ?", id),
+    insertWhen("INSERT INTO jobs_fts (job_id, body)", id, searchText),
+    ...cities.map((city) => insertWhen("INSERT INTO job_cities (job_id, city)", id, city)),
+    ...skills.map((skill) => insertWhen("INSERT OR IGNORE INTO job_skills (job_id, skill)", id, skill)),
+    ...gradYears.map((year) => insertWhen("INSERT INTO job_grad_years (job_id, year)", id, year)),
   ];
-  for (const city of cities) {
-    stmts.push(db.prepare("INSERT INTO job_cities (job_id, city) VALUES (?, ?)").bind(id, city));
-  }
-  for (const skill of skills) {
-    stmts.push(db.prepare("INSERT OR IGNORE INTO job_skills (job_id, skill) VALUES (?, ?)").bind(id, skill));
-  }
-  for (const year of gradYears) {
-    stmts.push(db.prepare("INSERT INTO job_grad_years (job_id, year) VALUES (?, ?)").bind(id, year));
-  }
+  stmts.push(
+    existing
+      ? when(`UPDATE jobs SET ${names.map((n) => `${n} = ?`).join(", ")} WHERE id = ?`, ...values, id)
+      : insertWhen(`INSERT INTO jobs (id, company_id, created_at, ${names.join(", ")})`, id, company.id, now, ...values),
+  );
   return stmts;
 }
 
@@ -485,23 +508,19 @@ export const jobOps = [
             ),
         ];
         if (name !== existing.name) {
-          // 岗位的搜索文本里有公司名，改名后要跟着重算，不然按新名字搜不到
-          const { results: jobs } = await ctx.db
-            .prepare("SELECT * FROM jobs WHERE company_id = ?")
-            .bind(existing.id)
-            .all<JobRow>();
-          for (const job of jobs) {
-            const text = jobSearchText(jobFieldsFromRow(job), name);
-            stmts.push(
-              ctx.db.prepare("UPDATE jobs SET search_text = ? WHERE id = ?").bind(text, job.id),
-              ctx.db.prepare("DELETE FROM jobs_fts WHERE job_id = ?").bind(job.id),
-              ctx.db.prepare("INSERT INTO jobs_fts (job_id, body) VALUES (?, ?)").bind(job.id, text),
-            );
-          }
+          // 岗位的搜索文本里有公司名，改名后要跟着重算，不然按新名字搜不到。
+          // 在 SQL 里按库内当前的岗位算，和改名在同一个 batch 里
+          stmts.push(
+            ctx.db
+              .prepare(`UPDATE jobs SET search_text = ${SEARCH_TEXT_SQL} WHERE company_id = ?`)
+              .bind(JSON.stringify(CATEGORY_NAMES), existing.id),
+            ctx.db.prepare("DELETE FROM jobs_fts WHERE job_id IN (SELECT id FROM jobs WHERE company_id = ?)").bind(existing.id),
+            ctx.db
+              .prepare("INSERT INTO jobs_fts (job_id, body) SELECT id, search_text FROM jobs WHERE company_id = ?")
+              .bind(existing.id),
+          );
         }
-        // 每个岗位占 3 条语句。岗位多时分批提交，按 3 的倍数切
-        await run(stmts.slice(0, 1 + 60));
-        for (let i = 61; i < stmts.length; i += 60) await run(stmts.slice(i, i + 60));
+        await run(stmts);
       }
       const company = await primaryCompany(ctx.db, ctx.auth.accountId);
       return { company: companyToApi(company!, { withContact: true }) };
@@ -539,7 +558,8 @@ export const jobOps = [
       }
       const id = newId("job");
       const now = nowIso();
-      await ctx.db.batch(jobWriteStatements(ctx.db, id, company, fields, "open", now, now, now));
+      const results = await ctx.db.batch(jobWriteStatements(ctx.db, id, company, fields, "open", now, now));
+      if (!results.at(-1)?.meta.changes) throw changedConcurrently("公司资料");
       return { job: await getJob(ctx, id) };
     },
   }),
@@ -558,11 +578,7 @@ export const jobOps = [
     handler: async (ctx, input) => {
       const { job_id, status, ...patch } = input;
       const { job, company } = await loadJob(ctx.db, job_id, ctx.auth.accountId);
-      if (job.status === "closed") {
-        throw new HireError("job_not_open", "这个岗位已经关闭，不能再修改。需要的话重新发布一个。", {
-          current_status: job.status,
-        });
-      }
+      if (job.status === "closed") throw closedJob();
       const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
       const merged = parseInput(JobFields, { ...jobFieldsFromRow(job), ...defined });
       checkJob(merged);
@@ -571,7 +587,13 @@ export const jobOps = [
       const next = status ?? job.status;
       // 暂停后重开算一次新的开放，订阅会把它当新岗位补发
       const openedAt = job.status === "paused" && next === "open" ? now : (job.opened_at ?? job.created_at);
-      await ctx.db.batch(jobWriteStatements(ctx.db, job.id, company, merged, next, job.created_at, openedAt, now));
+      // 读出来之后岗位被改过、被关闭，或公司改了名，整批不生效：不能拿旧状态把关闭的岗位重新打开
+      const results = await ctx.db.batch(jobWriteStatements(ctx.db, job.id, company, merged, next, openedAt, now, job));
+      if (!results.at(-1)?.meta.changes) {
+        const fresh = await loadJob(ctx.db, job.id);
+        if (fresh.job.status === "closed") throw closedJob();
+        throw changedConcurrently("岗位");
+      }
       return { job: await getJob(ctx, job.id) };
     },
   }),
@@ -589,61 +611,37 @@ export const jobOps = [
     idempotent: true,
     input: JobCloseInput,
     handler: async (ctx, input) => {
-      const { job, company } = await loadJob(ctx.db, input.job_id, ctx.auth.accountId);
-      if (job.status === "closed") return { job: jobToApi(job, company), closed_applications: 0 };
+      const { job } = await loadJob(ctx.db, input.job_id, ctx.auth.accountId);
+      const db = ctx.db;
       const now = nowIso();
-      const { results: active } = await ctx.db
-        .prepare(
-          `SELECT id, candidate_id, status FROM applications
-           WHERE job_id = ? AND status IN (${placeholders(PENDING_STATUSES.length)})`,
-        )
-        .bind(job.id, ...PENDING_STATUSES)
-        .all<{ id: string; candidate_id: string; status: string }>();
-
-      const stmts: D1PreparedStatement[] = [
-        ctx.db.prepare("UPDATE jobs SET status = 'closed', updated_at = ? WHERE id = ?").bind(now, job.id),
-      ];
-      for (const app of active) {
-        const rev = randomHex(8);
-        const guard = "WHERE EXISTS (SELECT 1 FROM applications WHERE id = ? AND rev = ?)";
-        stmts.push(
-          ctx.db
-            .prepare(
-              `UPDATE applications SET status = 'closed', closed_by = 'system', ended_at = ?, rev = ?, updated_at = ?
-               WHERE id = ? AND status = ?`,
-            )
-            .bind(now, rev, now, app.id, app.status),
-          ctx.db
-            .prepare(
-              `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
-               SELECT ?, 'system', ?, 'closed', ?, ? ${guard}`,
-            )
-            .bind(app.id, app.status, input.note ?? null, now, app.id, rev),
-          ctx.db
-            .prepare(
-              `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
-               SELECT ?, 'candidate', 'application.closed', ?, ?, ? ${guard}`,
-            )
-            .bind(
-              app.candidate_id,
-              app.id,
-              JSON.stringify({
-                job_id: job.id,
-                job_title: job.title,
-                counterpart: company.name,
-                status: "closed",
-                note: input.note ?? null,
-              }),
-              now,
-              app.id,
-              rev,
-            ),
-        );
-      }
-      // 每条投递占 3 条语句。分批提交时按 3 的倍数切，保证同一条投递的语句在同一批里
-      await ctx.db.batch(stmts.slice(0, 1 + 60));
-      for (let i = 61; i < stmts.length; i += 60) await ctx.db.batch(stmts.slice(i, i + 60));
-      return { job: await getJob(ctx, job.id), closed_applications: active.length };
+      const note = input.note ?? null;
+      // 按状态集合一次改完，和岗位一起在一个 batch 里。已关闭的岗位再调一次，会补上之前遗留的投递
+      const pending = `a.job_id = ? AND a.status IN (${placeholders(PENDING_STATUSES.length)})`;
+      const [, , closed] = await db.batch([
+        db
+          .prepare(
+            `INSERT INTO application_logs (application_id, actor, from_status, to_status, note, created_at)
+             SELECT a.id, 'system', a.status, 'closed', ?, ? FROM applications a WHERE ${pending}`,
+          )
+          .bind(note, now, job.id, ...PENDING_STATUSES),
+        db
+          .prepare(
+            `INSERT INTO events (account_id, audience, type, application_id, payload, created_at)
+             SELECT a.candidate_id, 'candidate', 'application.closed', a.id,
+                    json_object('job_id', j.id, 'job_title', j.title, 'counterpart', c.name, 'status', 'closed', 'note', ?), ?
+             FROM applications a JOIN jobs j ON j.id = a.job_id JOIN companies c ON c.id = j.company_id
+             WHERE ${pending}`,
+          )
+          .bind(note, now, job.id, ...PENDING_STATUSES),
+        db
+          .prepare(
+            `UPDATE applications AS a SET status = 'closed', closed_by = 'system', ended_at = ?, updated_at = ?,
+               rev = lower(hex(randomblob(8))) WHERE ${pending}`,
+          )
+          .bind(now, now, job.id, ...PENDING_STATUSES),
+        db.prepare("UPDATE jobs SET status = 'closed', updated_at = ? WHERE id = ? AND status <> 'closed'").bind(now, job.id),
+      ]);
+      return { job: await getJob(ctx, job.id), closed_applications: closed?.meta.changes ?? 0 };
     },
   }),
 

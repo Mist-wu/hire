@@ -1,14 +1,16 @@
 import type { Context } from "hono";
+import pkg from "../package.json";
 import type { Env, Role } from "./env";
 import { HireError } from "./errors";
 import { OPS, opsFor, requireScope, touchActive } from "./ops";
-import { inputSchema, makeCtx } from "./rest";
+import { inputSchema } from "./registry";
+import { makeCtx } from "./rest";
 import { parseInput } from "./schemas";
 
 type C = Context<{ Bindings: Env }>;
 
 const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "hire", title: "hire 招聘平台", version: "0.1.0" };
+const SERVER_INFO = { name: "hire", title: "hire 招聘平台", version: pkg.version };
 
 const INSTRUCTIONS = `hire 是给 AI agent 用的招聘平台，没有网页。一个账号只有一种身份：求职者或招聘者，你能看到的工具就是这个身份能用的。
 求职者：先 profile_get 看资料，缺什么用 profile_update 补；用 jobs_search 按硬条件过滤，再用 job_get 读详情自己判断；岗位有筛选问题时先问用户再 application_create 投递；想持续关注就 subscription_create 订阅。

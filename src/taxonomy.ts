@@ -8,7 +8,7 @@ export const RECRUIT_TYPES = {
 export type RecruitType = keyof typeof RECRUIT_TYPES;
 export const INTERN_TYPES: RecruitType[] = ["intern_grad", "intern_daily"];
 
-export const CATEGORY_TREE = {
+const CATEGORY_TREE = {
   tech: {
     name: "技术",
     children: {
@@ -178,7 +178,4 @@ export const ENUM_DOCS = {
   salary_unit: describe(SALARY_UNITS),
   status: describe(APPLICATION_STATUSES),
   reject_reason: describe(REJECT_REASONS),
-  category: Object.entries(CATEGORY_TREE)
-    .map(([l1, g]) => `${l1}（${g.name}）: ${Object.entries(g.children).map(([k, v]) => `${l1}.${k}=${v}`).join("，")}`)
-    .join("；"),
 };

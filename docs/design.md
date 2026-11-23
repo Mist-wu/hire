@@ -63,11 +63,15 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 确认页只能在发起授权的那个浏览器里完成。服务端在第 1 步种一个 cookie，第 2、3 步都要核对它。
 
-令牌拿到的范围按两步算：先取客户端申请的范围，没申请就算全部；再只留账号那种身份的。很多客户端会直接申请服务端支持的全部范围，所以第二步不能省。客户端只申请了另一种身份的范围时，确认页直接说明这个账号是什么身份，不发令牌。
+令牌拿到的范围按两步算：先取客户端申请的范围，没申请就算全部；再只留账号那种身份的。申请里写了不认识的范围直接报 `invalid_scope`，不当作没申请。很多客户端会直接申请服务端支持的全部范围，所以第二步不能省。客户端只申请了另一种身份的范围时，确认页直接说明这个账号是什么身份，不发令牌。
 
 连接器地址只有一个：`/mcp`。工具列表按令牌的范围过滤，求职者和招聘者各看到自己能用的工具。
 
 **（2）命令行和技能包：设备码。** agent 向服务端要一个设备码，并说明要哪些范围，只能是一种身份的。账号已经是另一种身份时，换令牌这一步返回 `access_denied`。服务端转去向 GitHub 申请，把 GitHub 的验证地址和用户码返回给 agent。人在 `github.com/login/device` 输入用户码。agent 轮询换令牌的端点，拿到令牌。这条路不经过 hire 的任何页面。
+
+令牌绑定资源（RFC 8707）。`/mcp` 和 `/v1` 是同一个资源，用受保护资源元数据里的 `<服务地址>/mcp` 表示。授权、设备码、换令牌和刷新都可以带 `resource`，不传就是它，传别的返回 `invalid_target`；刷新时不能换。加上绑定之前签发的令牌没有受众，照旧可用，刷新后换成绑定的。
+
+客户端只登记了一个回调地址时，授权请求可以不传 `redirect_uri`。
 
 令牌是随机串，库里只存哈希。访问令牌有效 1 小时，刷新令牌有效 30 天。刷新令牌只能用一次，每次刷新都换一对新的。授权码也只能用一次，5 分钟内有效。
 
@@ -174,7 +178,7 @@ hire 是一个演示项目，目标是跑通一条完整流程：HR 的 agent �
 
 ### 订阅 `subscriptions`
 
-求职者保存的一组岗位搜索条件，每个账号最多 5 个。字段：`id`、`name`、`filters`（和岗位搜索的过滤项相同）、`cursor_at`（已经算到哪个发布时间）。
+求职者保存的一组岗位搜索条件，每个账号最多 5 个。字段：`id`、`name`、`filters`（和岗位搜索的过滤项相同）、`cursor_at` 和 `cursor_job_id`（已经算到哪个开放时间的哪个岗位）。推过的岗位记在 `job_notifications` 里，每个账号每个岗位一行。
 
 ## 活跃度
 
@@ -193,7 +197,7 @@ BOSS 直聘靠“刚刚活跃”“回复率”让求职者避开没人管的岗
 
 ## 筛选问题
 
-agent 可以批量投递，这是 agent 平台特有的风险。除了每天 20 次的限额，岗位还可以带最多 3 个筛选问题，投递时必须逐个回答。
+agent 可以批量投递，这是 agent 平台特有的风险。除了每天的投递限额，岗位还可以带最多 3 个筛选问题，投递时必须逐个回答。
 
 - 每个问题有 `text`，可选 `options`（2 到 6 项）。有 `options` 是单选题，回答必须是其中一项；没有是问答题，500 字以内。
 - `application_create` 的 `answers` 是字符串数组，顺序和岗位的 `questions` 一致。
@@ -204,13 +208,13 @@ agent 可以批量投递，这是 agent 平台特有的风险。除了每天 20 
 
 ## 订阅
 
-BOSS 直聘用推荐把新岗位推给求职者。这里服务端不打分，改成订阅：求职者保存一组搜索条件，之后有新发布的岗位符合条件时，`events_poll` 里出现一条 `job.matched` 事件。每人最多 5 个订阅。条件存之前先归一化：城市别名统一，技能去重排序，空关键词去掉。换个写法的相同条件不能建两个。
+BOSS 直聘用推荐把新岗位推给求职者。这里服务端不打分，改成订阅：求职者保存一组搜索条件，之后有新发布的岗位符合条件时，`events_poll` 里出现一条 `job.matched` 事件。每人最多 5 个订阅。条件存之前先归一化：城市别名统一，技能去重排序，空关键词去掉，键名排序。换个写法的相同条件不能建两个，同时创建也由唯一索引挡住。
 
-匹配在拉取事件时才算，不在发布岗位时算。每次拉取最多查 5 个订阅，发布岗位不用遍历所有人的订阅。订阅只对创建之后开放的岗位生效：新发布的，以及暂停后重新开放的。每个订阅每次拉取最多写 20 条事件，没写完时 `has_more` 为 true，再拉一次就能拿到剩下的。同一个岗位只通知一次，哪怕它命中了几个订阅，或者暂停后又重开。
+匹配在拉取事件时才算，不在发布岗位时算。每次拉取最多查 5 个订阅，发布岗位不用遍历所有人的订阅。订阅只对创建之后开放的岗位生效：新发布的，以及暂停后重新开放的。每个订阅每次拉取最多写 20 条事件，没写完时 `has_more` 为 true，再拉一次就能拿到剩下的。同一个岗位只通知一次，哪怕它命中了几个订阅，或者暂停后又重开。推过的岗位单独记一张表，不靠 30 天后会清掉的事件判断。
 
 ## 可见性
 
-简历内容对所有登录用户公开，没有匿名阶段。只有三样东西受保护：手机号、邮箱、PDF 原件。
+简历内容对所有招聘者公开，没有匿名阶段。只有三样东西受保护：手机号、邮箱、PDF 原件。
 
 | 谁在看 | 能看到 |
 |---|---|
@@ -247,6 +251,7 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | — | `invited` | 招聘者 | 主动邀约，跳过前两步 |
 | `applied` | `viewed` | 招聘者 | 第一次读投递详情，自动变化 |
 | `applied`、`viewed` | `invited` | 招聘者 | 发出邀约 |
+| `invited`、`accepted` | `invited` | 招聘者 | 改面试时间 |
 | `invited` | `accepted` | 求职者 | 接受，并选一个时间 |
 | `invited` | `rejected` | 求职者 | 拒绝邀约 |
 | `accepted` | `offered` | 招聘者 | 发出录用 |
@@ -255,6 +260,7 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 | 任何非终态 | `rejected` | 招聘者 | 拒绝，必须选原因 |
 | 任何非终态 | `withdrawn` | 求职者 | 撤回 |
 | `applied`、`viewed`、`invited` | `closed` | 系统 | 岗位被关闭 |
+| 任何非终态 | `closed` | 系统 | 定时任务清理没人管的投递，见下 |
 
 招聘者拒绝时必须从下面选一个原因，求职者能看到：`skills_mismatch`（技能不匹配）、`experience_mismatch`（经历不匹配）、`education_mismatch`（学历或届别不符）、`availability`（到岗时间或每周天数不合适）、`interview_failed`（面试未通过）、`position_filled`（岗位已招满）、`other`（其他）。
 
@@ -302,14 +308,14 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 ## 限额
 
-| 对象 | 上限 | 说明 |
+| 对象 | 默认上限 | 说明 |
 |---|---|---|
 | 求职者投递 | 每天 20 次 | 撤回不返还。上限写在插入语句的条件里，并发请求也挤不过去 |
 | 招聘者主动邀约 | 每个岗位每天 20 次 | 回应投递的邀约不计入 |
 | 搜索 | 每分钟 30 次 | 求职者和招聘者相同 |
 | 事件轮询 | 每分钟 6 次 | |
 
-“每天”按北京时间 0 点重置。超出时返回 HTTP 429，错误码 `quota_exceeded`，并带 `reset_at`。四个数字都是配置项。
+“每天”按北京时间 0 点重置。超出时返回 HTTP 429，错误码 `quota_exceeded`，并带 `reset_at`。四个数字都是配置项，agent 用 `quota_get` 查当前的值和余量。
 
 ## 分类表
 
@@ -327,7 +333,7 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 ### 职类
 
-两级。存储时用“一级。二级”的编码，如 `tech.backend`。搜索时可以只传一级。
+两级。存储时用“一级.二级”的编码，如 `tech.backend`。搜索时可以只传一级。
 
 | 一级 | 二级 |
 |---|---|
@@ -362,59 +368,15 @@ PDF 里通常印着手机号，所以它和手机号受同样的保护。
 
 ## 接口
 
-REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路径都以 `/v1` 开头。两者由同一份操作注册表生成，OpenAPI 文档（`/v1/openapi.json`）也是。
+REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路径都以 `/v1` 开头。两者和 OpenAPI 文档由同一份操作注册表生成。
 
-范围一栏写了两个的，有其中一个就能调用。
-
-### 求职者
-
-| MCP 工具 | REST | 只读 | 范围 |
-|---|---|---|---|
-| `profile_get` | `GET /me/profile` | 是 | `candidate:read` |
-| `profile_update` | `PATCH /me/profile` | 否 | `candidate:write` |
-| `resume_upload` | `PUT /me/resume/pdf` | 否 | `candidate:write` |
-| `profile_delete` | `POST /me/profile/delete` | 否 | `candidate:write` |
-| `application_create` | `POST /applications` | 否 | `candidate:apply` |
-| `applications_list` | `GET /applications` | 是 | `candidate:read` |
-| `application_withdraw` | `POST /applications/{id}/withdraw` | 否 | `candidate:apply` |
-| `invitation_respond` | `POST /applications/{id}/respond` | 否 | `candidate:apply` |
-| `offer_respond` | `POST /applications/{id}/offer/respond` | 否 | `candidate:apply` |
-| `subscription_create` | `POST /subscriptions` | 否 | `candidate:write` |
-| `subscriptions_list` | `GET /subscriptions` | 是 | `candidate:read` |
-| `subscription_delete` | `POST /subscriptions/{id}/delete` | 否 | `candidate:write` |
-
-### 招聘者
-
-| MCP 工具 | REST | 只读 | 范围 |
-|---|---|---|---|
-| `company_get` | `GET /company` | 是 | `recruiter:read` |
-| `company_upsert` | `PUT /company` | 否 | `recruiter:write` |
-| `job_create` | `POST /jobs` | 否 | `recruiter:write` |
-| `job_update` | `PATCH /jobs/{id}` | 否 | `recruiter:write` |
-| `job_close` | `POST /jobs/{id}/close` | 否 | `recruiter:write` |
-| `job_stats` | `GET /jobs/{id}/stats` | 是 | `recruiter:read` |
-| `candidates_search` | `GET /candidates` | 是 | `recruiter:read` |
-| `candidate_get` | `GET /candidates/{id}` | 是 | `recruiter:read` |
-| `job_applications_list` | `GET /jobs/{id}/applications` | 是 | `recruiter:read` |
-| `invitation_create` | `POST /invitations` | 否 | `recruiter:invite` |
-| `offer_create` | `POST /applications/{id}/offer` | 否 | `recruiter:invite` |
-| `application_reject` | `POST /applications/{id}/reject` | 否 | `recruiter:invite` |
-
-### 求职者和招聘者都有
-
-| MCP 工具 | REST | 只读 | 范围 |
-|---|---|---|---|
-| `jobs_search` | `GET /jobs` | 是 | `candidate:read` 或 `recruiter:read` |
-| `job_get` | `GET /jobs/{id}` | 是 | `candidate:read` 或 `recruiter:read` |
-| `application_get` | `GET /applications/{id}` | 否 | `candidate:read` 或 `recruiter:read` |
-| `events_poll` | `GET /events` | 是 | 任意 |
-| `quota_get` | `GET /quota` | 是 | 任意 |
+每个操作的 REST 路径、入参、权限范围和只读标记见 `/v1/openapi.json`，有对应 MCP 工具的操作，`operationId` 就是工具名。列了几个范围的，有其中一个就能调用。
 
 共 29 个工具。求职者能看到 17 个，其中 8 个只读；招聘者能看到 17 个，其中 9 个只读。
 
 `application_get` 对求职者是只读的，对招聘者不是：招聘者第一次调用时，投递会从“已投递”变成“已查看”，并给求职者发一条事件。它是幂等的，重复调用不再产生变化。工具列表里的只读标记按令牌的身份给出。
 
-另有两个下载 PDF 的地址，只有 REST，没有对应的工具：
+另有两个下载 PDF 的地址，只有 REST，没有对应的工具，OpenAPI 里也列着：
 
 - `GET /me/resume/pdf`：求职者下载自己上传的 PDF。
 - `GET /applications/{id}/resume.pdf`：招聘者下载求职者的 PDF，投递必须是“已接受”“已发录用”或“已录用”。
@@ -464,9 +426,11 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 }
 ```
 
-`message` 写给 agent 看：说清楚发生了什么，能做什么。错误码有 `unauthorized`、`forbidden_scope`、`not_found`、`validation_failed`、`invalid_transition`、`duplicate_application`、`quota_exceeded`、`job_not_open`。
+`message` 写给 agent 看：说清楚发生了什么，能做什么。错误码有 `unauthorized`、`forbidden_scope`、`not_found`、`validation_failed`、`invalid_transition`、`duplicate_application`、`quota_exceeded`、`job_not_open`、`not_configured`（没配 GitHub 登录）、`internal`。OAuth 端点（`/oauth/*`）按 OAuth 规范返回 `{ "error", "error_description" }`，不用这个结构。
 
 `validation_failed` 的 `details` 里逐个列出出错的字段和原因，agent 可以据此改正后重试。
+
+同一个错误码下要分开处理的情况，`details.reason` 会写明：接受录用时岗位招满了是 `job_not_open` 加 `headcount_reached`，对方还没接受邀约就下载 PDF 是 `invalid_transition` 加 `contact_locked`。
 
 ## 技术选型
 
@@ -480,8 +444,8 @@ REST 是主体，MCP 工具是同一组处理函数的另一种入口。REST 路
 | 全文搜索 | SQLite FTS5，trigram 分词 | 默认分词器不切分中文，trigram 能做子串匹配 |
 | 文件 | R2 存 PDF | 数据库里只存路径、文件名和大小 |
 | 入参校验 | zod | 同一份定义用来校验、生成 MCP 工具的入参说明和 OpenAPI |
-| MCP | 自己实现 Streamable HTTP 的无状态子集 | 只需要握手、列工具、调工具三件事，约 150 行，不依赖 Durable Objects |
-| OAuth | 自己实现 | 授权码、刷新、设备码共用一张令牌表，约 400 行 |
+| MCP | 自己实现 Streamable HTTP 的无状态子集 | 只需要握手、列工具、调工具三件事，不依赖 Durable Objects |
+| OAuth | 自己实现 | 授权码、刷新、设备码共用一张令牌表 |
 | 测试 | vitest 加 Cloudflare 的测试插件 | 测试跑在真实的 Workers 运行时里，D1 用本地实例 |
 
 trigram 分词至少要 3 个字符才能命中。搜“后端”这类两个字的词时，退回到对 `search_text` 列做 `LIKE` 匹配。`search_text` 在写入岗位或简历时由服务端拼好。
@@ -502,7 +466,7 @@ npx wrangler d1 migrations apply hire --remote
 npx wrangler deploy
 ```
 
-配置在 `wrangler.jsonc`：D1 和 R2 的绑定、四个限额、一个每天执行一次的定时任务。定时任务清理 30 天前的事件、过期的授权记录和令牌。
+配置在 `wrangler.jsonc`：D1 和 R2 的绑定、四个限额、一个每天执行一次的定时任务。定时任务清理 30 天前的事件、过期的授权记录、令牌和限频计数，并结束没人管的投递。
 
 GitHub 登录要两个密钥，用 `wrangler secret put` 设置：`GITHUB_CLIENT_ID` 和 `GITHUB_CLIENT_SECRET`。对应的 GitHub OAuth 应用要把回调地址设成 `<服务地址>/oauth/github/callback`，并勾选 Enable Device Flow。没设密钥时，登录相关的端点返回“未配置”的错误，其余接口不受影响。
 

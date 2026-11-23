@@ -1,4 +1,5 @@
-import { z } from "zod";
+import * as z from "zod";
+import zhCN from "zod/v4/locales/zh-CN.js";
 import { invalid, type FieldIssue } from "./errors";
 import {
   APPLICATION_STATUSES,
@@ -17,7 +18,7 @@ import {
   type RecruitType,
 } from "./taxonomy";
 
-z.config(z.locales.zhCN());
+z.config(zhCN());
 
 const str = (max: number) => z.string().trim().min(1).max(max);
 const httpUrl = z
@@ -30,12 +31,12 @@ const salary = () => z.int().min(0).max(MAX_SALARY);
 const month = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "格式为 YYYY-MM");
 const id = (what: string) => z.string().min(1).max(64).describe(`${what}编号`);
 
-export const RecruitTypeEnum = z.enum(keysOf(RECRUIT_TYPES)).describe(`招聘类型：${ENUM_DOCS.recruit_type}`);
-export const CategoryEnum = z.enum(CATEGORIES).describe("职类，写成“一级.二级”，从枚举里选最接近的");
-export const ExperienceEnum = z.enum(keysOf(EXPERIENCES)).describe(`经验要求：${ENUM_DOCS.experience}`);
-export const DegreeEnum = z.enum(keysOf(DEGREES)).describe(`学历：${ENUM_DOCS.degree}`);
-export const SalaryUnitEnum = z.enum(keysOf(SALARY_UNITS)).describe(`薪资单位：${ENUM_DOCS.salary_unit}`);
-export const StatusEnum = z.enum(keysOf(APPLICATION_STATUSES)).describe(`投递状态：${ENUM_DOCS.status}`);
+const RecruitTypeEnum = z.enum(keysOf(RECRUIT_TYPES)).describe(`招聘类型：${ENUM_DOCS.recruit_type}`);
+const CategoryEnum = z.enum(CATEGORIES).describe("职类，写成“一级.二级”，从枚举里选最接近的");
+const ExperienceEnum = z.enum(keysOf(EXPERIENCES)).describe(`经验要求：${ENUM_DOCS.experience}`);
+const DegreeEnum = z.enum(keysOf(DEGREES)).describe(`学历：${ENUM_DOCS.degree}`);
+const SalaryUnitEnum = z.enum(keysOf(SALARY_UNITS)).describe(`薪资单位：${ENUM_DOCS.salary_unit}`);
+const StatusEnum = z.enum(keysOf(APPLICATION_STATUSES)).describe(`投递状态：${ENUM_DOCS.status}`);
 const PersonDegreeEnum = z
   .enum(["junior_high", "secondary", "high", "college", "bachelor", "master", "doctor"])
   .describe("在读或已获得的最高学历");
@@ -231,7 +232,7 @@ export function checkResume(content: ResumeContent, prefix = ""): void {
   if (issues.length) throw invalid(issues);
 }
 
-export const Expectation = z.strictObject({
+const Expectation = z.strictObject({
   recruit_types: z.array(RecruitTypeEnum).max(5).optional().describe("想找的招聘类型"),
   cities: z.array(str(20)).max(10).optional().describe("期望城市"),
   days_per_week: z.int().min(1).max(7).optional().describe("每周能到岗几天"),
@@ -356,7 +357,7 @@ export const QuotaGetInput = z.strictObject({
   job_id: id("岗位").optional().describe("招聘者传它可以看这个岗位今天还能主动邀约几次"),
 });
 
-export function zodIssues(error: z.ZodError): FieldIssue[] {
+function zodIssues(error: z.ZodError): FieldIssue[] {
   return error.issues.map((issue) => ({
     field: issue.path.join(".") || "(整体)",
     message: issue.message,

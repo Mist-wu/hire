@@ -160,6 +160,7 @@ describe("邀约和录用", () => {
     expect(results.filter((r) => r.status === 200)).toHaveLength(1);
     const full = results.find((r) => r.status !== 200)!;
     expect(full.data.error.code).toBe("job_not_open");
+    expect(full.data.error.details.reason).toBe("headcount_reached");
     // 招聘者加了名额之后可以接受
     await api("PATCH", `/jobs/${job.id}`, hr, { headcount: 2 });
     const loser = people[results.findIndex((r) => r.status !== 200)]!;

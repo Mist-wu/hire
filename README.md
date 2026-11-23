@@ -62,14 +62,17 @@ npm test
 npm run migrate:local
 ```
 
+在 `.dev.vars` 里加一行 `DEV_LOGIN=1`（没有这个文件就新建，已有的内容不要覆盖），然后启动：
+
 ```bash
-echo 'DEV_LOGIN=1' > .dev.vars && npm run dev
+npm run dev
 ```
 
-`DEV_LOGIN=1` 会开启一个免 GitHub 的测试登录端点，只在本地用：
+`DEV_LOGIN=1` 会开启一个免 GitHub 的测试登录端点，只在本地用。新账号要在 `scope` 里选定一种身份，这里是求职者：
 
 ```bash
-curl -s -X POST http://localhost:8787/oauth/dev/token -H 'Content-Type: application/json' -d '{"login":"me"}'
+curl -s -X POST http://localhost:8787/oauth/dev/token -H 'Content-Type: application/json' \
+  -d '{"login":"me","scope":"candidate:read candidate:write candidate:apply"}'
 ```
 
 代码结构：

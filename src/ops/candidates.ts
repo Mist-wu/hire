@@ -11,13 +11,12 @@ import {
   checkResume,
 } from "../schemas";
 import { addCursor, addKeyword, paginate, placeholders, type Where } from "../search";
-import { DEGREE_RANK, type Degree } from "../taxonomy";
-import { ACTIVE_STATUSES } from "../taxonomy";
+import { ACTIVE_STATUSES, DEGREE_RANK, type Degree } from "../taxonomy";
 import { base64ToBytes, normCity, nowIso, parseJson, randomHex } from "../util";
 
-export const MAX_PDF_BYTES = 5 * 1024 * 1024;
+const MAX_PDF_BYTES = 5 * 1024 * 1024;
 
-export interface CandidateRow {
+interface CandidateRow {
   account_id: string;
   name: string | null;
   school: string | null;
@@ -294,7 +293,7 @@ export const candidateOps = [
     handler: async (ctx, input) => {
       const bytes = base64ToBytes(input.content_base64);
       if (!bytes) throw invalid([{ field: "content_base64", message: "不是合法的 base64。" }]);
-      return storePdf(ctx, input.filename, bytes);
+      return storePdf(ctx, input.filename, bytes, "content_base64");
     },
   }),
 
@@ -346,6 +345,7 @@ export const candidateOps = [
         db.prepare("DELETE FROM candidate_recruit_types WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM candidates_fts WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM subscriptions WHERE account_id = ?").bind(id),
+        db.prepare("DELETE FROM job_notifications WHERE account_id = ?").bind(id),
         db.prepare("DELETE FROM candidates WHERE account_id = ?").bind(id),
       ]);
       if (old?.pdf_key) await ctx.env.FILES.delete(old.pdf_key);
@@ -453,13 +453,11 @@ export const candidateOps = [
   }),
 ];
 
-export async function storePdf(ctx: Ctx, filename: string, bytes: Uint8Array) {
-  if (bytes.byteLength > MAX_PDF_BYTES) {
-    throw invalid([{ field: "content_base64", message: "文件超过 5 MB。" }]);
-  }
-  const header = new TextDecoder().decode(bytes.slice(0, 5));
-  if (header !== "%PDF-") {
-    throw invalid([{ field: "content_base64", message: "这不是 PDF 文件。只接受 PDF。" }]);
+/** field 是出错时报给调用方的位置：JSON 里的 content_base64、multipart 的 file，或者整个请求体。 */
+export async function storePdf(ctx: Ctx, filename: string, bytes: Uint8Array, field: string) {
+  if (bytes.byteLength > MAX_PDF_BYTES) throw invalid([{ field, message: "文件超过 5 MB。" }]);
+  if (new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") {
+    throw invalid([{ field, message: "这不是 PDF 文件。只接受 PDF。" }]);
   }
   const id = ctx.auth.accountId;
   const old = await loadCandidate(ctx.db, id);

@@ -1,33 +1,13 @@
 import type { Context, Hono } from "hono";
-import { z } from "zod";
 import { authenticate } from "./auth/tokens";
 import type { Ctx, Env } from "./env";
 import { HireError, invalid } from "./errors";
 import { OPS, requireScope, touchActive } from "./ops";
 import { storePdf } from "./ops/candidates";
-import type { Op } from "./registry";
+import { inputSchema, type Op } from "./registry";
 import { parseInput } from "./schemas";
 
 type C = Context<{ Bindings: Env }>;
-
-interface JsonSchema {
-  type?: string;
-  properties?: Record<string, JsonSchema>;
-  required?: string[];
-  [key: string]: unknown;
-}
-
-const schemaCache = new Map<string, JsonSchema>();
-
-export function inputSchema(op: Op): JsonSchema {
-  let schema = schemaCache.get(op.name);
-  if (!schema) {
-    schema = z.toJSONSchema(op.input) as JsonSchema;
-    delete schema.$schema;
-    schemaCache.set(op.name, schema);
-  }
-  return schema;
-}
 
 export async function makeCtx(c: C): Promise<Ctx> {
   return {
@@ -68,14 +48,14 @@ async function jsonBody(c: C): Promise<Record<string, unknown>> {
 /** PDF 上传除了 JSON 里放 base64，也接受 multipart（字段名 file）和直接发 PDF 内容。 */
 async function uploadPdf(c: C, ctx: Ctx) {
   const type = c.req.header("Content-Type") ?? "";
+  const filename = (name: string | undefined) => name?.trim().slice(0, 120) || "resume.pdf";
   if (type.includes("multipart/form-data")) {
     const form = await c.req.parseBody();
     const file = form.file;
     if (!(file instanceof File)) throw invalid([{ field: "file", message: "multipart 里要有一个名为 file 的文件字段。" }]);
-    return storePdf(ctx, file.name || "resume.pdf", new Uint8Array(await file.arrayBuffer()));
+    return storePdf(ctx, filename(file.name), new Uint8Array(await file.arrayBuffer()), "file");
   }
-  const name = c.req.query("filename") || "resume.pdf";
-  return storePdf(ctx, name.slice(0, 120), new Uint8Array(await c.req.arrayBuffer()));
+  return storePdf(ctx, filename(c.req.query("filename")), new Uint8Array(await c.req.arrayBuffer()), "(整体)");
 }
 
 export function mountRest(app: Hono<{ Bindings: Env }>): void {
